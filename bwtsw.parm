@@ -1,0 +1,16 @@
+#
+# This is a query parameter file for BWT-SW
+#
+
+[HitScoring]
+Match=1;                         # Reward for a match
+Mismatch=-3;                     # Penalty for a mismatch
+GapOpen=5;                       # Cost to open a gap
+GapExtension=2;                  # Cost to extend a gap
+
+[ExpectationValue]
+ExpectationValue=10;             # Minimum E-value to report an alignment
+
+#
+# end of file
+#
