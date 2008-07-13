@@ -54,7 +54,7 @@ void ProcessFileName(char *outputFileName, const char *inputFileName, const char
 	int ParseFASTA = TRUE;
 	int BuildBWT = TRUE;
 	int BuildSaValue = TRUE;
-	int BuildSaIndex = TRUE;
+	int BuildCachedSaIndex = TRUE;
 
 	// Memory parameters
 	unsigned int PoolSize = 2097152;				// 2M  - fixed; not configurable through ini
@@ -71,7 +71,7 @@ void ProcessFileName(char *outputFileName, const char *inputFileName, const char
 	char BWTCodeFileName[MAX_FILENAME_LEN+1] = "*.bwt";
 	char BWTOccValueFileName[MAX_FILENAME_LEN+1] = "*.fmv";
 	char SaValueFileName[MAX_FILENAME_LEN+1] = "*.sa";
-	char SaIndexFileName[MAX_FILENAME_LEN+1] = "*.sai";
+	char CachedSaIndexFileName[MAX_FILENAME_LEN+1] = "*.sai";
 
 	// Parse FASTA parameters
 	unsigned int FASTARandomSeed = 0;
@@ -87,7 +87,7 @@ void ProcessFileName(char *outputFileName, const char *inputFileName, const char
 	unsigned int SaValueFreq = 8;
 
 	// Build SA index parameters
-	unsigned int SaIndexNumOfChar = 12;
+	unsigned int CachedSaIndexNumOfChar = 12;
 
 
 
@@ -185,7 +185,7 @@ int main(int argc, char** argv) {
 	}
 
 	// Load BWT
-	if (BuildSaValue || BuildSaIndex) {
+	if (BuildSaValue || BuildCachedSaIndex) {
 
 		printf("Loading BWT...\n");
 
@@ -208,9 +208,9 @@ int main(int argc, char** argv) {
 		printf("Building SA value...\n");
 		
 		if (ShowProgress) {
-			BWTGenerateSaValue(mmPool, bwt, SaValueFreq, bwt->textLength / SaValueFreq / 10);
+			BWTGenerateSaValue(bwt, SaValueFreq, bwt->textLength / SaValueFreq / 10);
 		} else {
-			BWTGenerateSaValue(mmPool, bwt, SaValueFreq, 0);
+			BWTGenerateSaValue(bwt, SaValueFreq, 0);
 		}
 		BWTSaveSaValue(bwt, SaValueFileName);
 
@@ -224,13 +224,13 @@ int main(int argc, char** argv) {
 
 	}
 
-	if (BuildSaIndex) {
+	if (BuildCachedSaIndex) {
 
-		printf("Building SA index...\n");
+		printf("Building cached SA index...\n");
 		
-		BWTGenerateSaRangeTable(bwt, SaIndexNumOfChar, SaIndexFileName);
+		BWTGenerateCachedSaIndex(bwt, CachedSaIndexNumOfChar, CachedSaIndexFileName);
 
-		printf("Finished building SA index.  ");
+		printf("Finished building cached SA index.  ");
 
 		elapsedTime = getElapsedTime(startTime) - totalElapsedTime;
 		printf("Elapsed time = ");
@@ -241,7 +241,7 @@ int main(int argc, char** argv) {
 	}
 
 	// Free BWT
-	if (BuildSaValue || BuildSaIndex) {
+	if (BuildSaValue || BuildCachedSaIndex) {
 		BWTFree(mmPool, bwt);
 	}
 
@@ -323,7 +323,7 @@ void ParseIniFile(char *iniFileName) {
 	ParseFASTA = iniparser_getboolean(ini, "BuildTasks:ParseFASTA", ParseFASTA);
 	BuildBWT = iniparser_getboolean(ini, "BuildTasks:BuildBWT", BuildBWT);
 	BuildSaValue = iniparser_getboolean(ini, "BuildTasks:BuildSaValue", BuildSaValue);
-	BuildSaIndex = iniparser_getboolean(ini, "BuildTasks:BuildSaIndex", BuildSaIndex);
+	BuildCachedSaIndex = iniparser_getboolean(ini, "BuildTasks:BuildCachedSaIndex", BuildCachedSaIndex);
 
 	// Display parameters
 	ShowProgress = iniparser_getboolean(ini, "Display:ShowProgress", ShowProgress);
@@ -344,7 +344,7 @@ void ParseIniFile(char *iniFileName) {
 	SaValueFreq = iniparser_getint(ini, "BuildSAValue:SaValueFreq", SaValueFreq);
 
 	// Build SA index parameters
-	SaIndexNumOfChar = iniparser_getint(ini, "BuildSAIndex:SaIndexNumOfChar", SaIndexNumOfChar);
+	CachedSaIndexNumOfChar = iniparser_getint(ini, "BuildSAIndex:CachedSaIndexNumOfChar", CachedSaIndexNumOfChar);
 
 	// Database parameters
 	iniparser_copystring(ini, "Database:AnnotationFileName", AnnotationFileName, AnnotationFileName, MAX_FILENAME_LEN);
@@ -353,7 +353,7 @@ void ParseIniFile(char *iniFileName) {
 	iniparser_copystring(ini, "Database:BWTCodeFileName", BWTCodeFileName, BWTCodeFileName, MAX_FILENAME_LEN);
 	iniparser_copystring(ini, "Database:BWTOccValueFileName", BWTOccValueFileName, BWTOccValueFileName, MAX_FILENAME_LEN);
 	iniparser_copystring(ini, "Database:SaValueFileName", SaValueFileName, SaValueFileName, MAX_FILENAME_LEN);
-	iniparser_copystring(ini, "Database:SaIndexFileName", SaIndexFileName, SaIndexFileName, MAX_FILENAME_LEN);
+	iniparser_copystring(ini, "Database:CachedSaIndexFileName", CachedSaIndexFileName, CachedSaIndexFileName, MAX_FILENAME_LEN);
 
 	iniparser_freedict(ini);
 
@@ -367,13 +367,13 @@ void ProcessIni() {
 	ProcessFileName(BWTCodeFileName, BWTCodeFileName, DatabaseName);
 	ProcessFileName(BWTOccValueFileName, BWTOccValueFileName, DatabaseName);
 	ProcessFileName(SaValueFileName, SaValueFileName, DatabaseName);
-	ProcessFileName(SaIndexFileName, SaIndexFileName, DatabaseName);
+	ProcessFileName(CachedSaIndexFileName, CachedSaIndexFileName, DatabaseName);
 
 }
 
 void ValidateIni() {
 
-	if (!ParseFASTA && !BuildBWT && !BuildSaValue && !BuildSaIndex) {
+	if (!ParseFASTA && !BuildBWT && !BuildSaValue && !BuildCachedSaIndex) {
 		fprintf(stderr, "No action is specified!\n");
 		exit(1);
 	}
@@ -428,7 +428,7 @@ void ValidateIni() {
 		}
 	}
 
-	if (BuildSaIndex) {
+	if (BuildCachedSaIndex) {
 		if (BWTCodeFileName[0] == '\0') {
 			fprintf(stderr, "BWT code file is not specified!\n");
 			exit(1);
@@ -437,15 +437,15 @@ void ValidateIni() {
 			fprintf(stderr, "BWT Occ value file is not specified!\n");
 			exit(1);
 		}
-		if (SaIndexFileName[0] == '\0') {
+		if (CachedSaIndexFileName[0] == '\0') {
 			fprintf(stderr, "SA index file name is not specified!\n");
 			exit(1);
 		}
-		if (SaIndexNumOfChar <= 0) {
+		if (CachedSaIndexNumOfChar <= 0) {
 			fprintf(stderr, "SA index number of character must > 0!\n");
 			exit(1);
 		}
-		if (SaIndexNumOfChar > 13) {
+		if (CachedSaIndexNumOfChar > 13) {
 			fprintf(stderr, "SA index number of character must <= 13!\n");
 			exit(1);
 		}
@@ -464,7 +464,7 @@ void PrintIni() {
 	printf("Parse FASTA file    : %c\n", boolean[ParseFASTA]);
 	printf("Build BWT           : %c\n", boolean[BuildBWT]);
 	printf("Build SA value      : %c\n", boolean[BuildSaValue]);
-	printf("Build SA index      : %c\n", boolean[BuildSaIndex]);
+	printf("Build SA index      : %c\n", boolean[BuildCachedSaIndex]);
 	printf("\n");
 
 	printf("Show progress       : %c\n", boolean[ShowProgress]);
@@ -492,9 +492,9 @@ void PrintIni() {
 		printf("\n");
 	}
 
-	if (BuildSaIndex) {
+	if (BuildCachedSaIndex) {
 		printf("Build SA index :\n");
-		printf("SA index no. of char    : %u\n", SaIndexNumOfChar);
+		printf("SA index no. of char    : %u\n", CachedSaIndexNumOfChar);
 		printf("\n");
 	}
 
@@ -504,7 +504,7 @@ void PrintIni() {
 	printf("BWT Code file            : %s\n", BWTCodeFileName);
 	printf("BWT Occ value file       : %s\n", BWTOccValueFileName);
 	printf("SA value file            : %s\n", SaValueFileName);
-	printf("SA index file            : %s\n", SaIndexFileName);
+	printf("Cached SA index file     : %s\n", CachedSaIndexFileName);
 	printf("\n");
 
 }

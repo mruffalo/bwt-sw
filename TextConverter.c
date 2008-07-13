@@ -627,7 +627,7 @@ unsigned int ReadBytePackedAsWordPacked(const char *inputFileName, const unsigne
 }
 
 // Alphabet size of DNA must be 4
-void *DNALoadPacked(const char *inputFileName, unsigned int *textLength, const unsigned int convertToWordPacked) {
+void *DNALoadPacked(const char *inputFileName, unsigned int *textLength, const unsigned int convertToWordPacked, const unsigned int trailerBufferInWord) {
 
 	FILE *inputFile;
 	unsigned char tempChar[4];
@@ -636,6 +636,9 @@ void *DNALoadPacked(const char *inputFileName, unsigned int *textLength, const u
 	unsigned char lastByteLength;
 	unsigned int wordToProcess;
 	unsigned int i;
+	unsigned int trailerBufferIn128;
+
+	trailerBufferIn128 = (trailerBufferInWord + 3) / 4 * 4;
 
 	inputFile = (FILE*)(FILE*)fopen64(inputFileName, "rb");
 
@@ -654,10 +657,12 @@ void *DNALoadPacked(const char *inputFileName, unsigned int *textLength, const u
 
 	*textLength = (packedFileLen - 1) * 4 + lastByteLength;
 
-	wordToProcess = (*textLength + 16 - 1) / 16;
-	packedText = MMUnitAllocate((wordToProcess + 1) * sizeof(unsigned int));	// allocate 1 more word at end
-	packedText[wordToProcess - 1] = 0;
-	packedText[wordToProcess] = 0;
+	wordToProcess = (*textLength + 64 - 1) / 64 * 4 + trailerBufferIn128 * 4;		// allocate multiple of 128 bit + trailer buffer
+
+	packedText = MMUnitAllocate(wordToProcess * sizeof(unsigned int));
+	for (i=(*textLength)/16; i<wordToProcess; i++) {
+		packedText[i] = 0;
+	}
 
 	fseek(inputFile, 0, SEEK_SET);
 	fread(packedText, 1, packedFileLen, inputFile);
@@ -678,9 +683,13 @@ void *DNALoadPacked(const char *inputFileName, unsigned int *textLength, const u
 
 }
 
-void DNAFreePacked(void* packedDNA, const unsigned int textLength) {
+void DNAFreePacked(void* packedDNA, const unsigned int textLength, const unsigned int trailerBufferInWord) {
 
-	MMUnitFree(packedDNA, ((textLength + 16 - 1) / 16 + 1) * sizeof(unsigned int));
+	unsigned int trailerBufferIn128;
+
+	trailerBufferIn128 = (trailerBufferInWord + 3) / 4 * 4;
+
+	MMUnitFree(packedDNA, ((textLength + 64 - 1) / 64 * 4 + trailerBufferIn128 * 4) * sizeof(unsigned int));
 
 }
 

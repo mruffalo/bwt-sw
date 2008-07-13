@@ -133,7 +133,7 @@ For this reason, SCORE_MIN is not simply defined to be LONG_MIN/2.
 #define BLAST_KARLIN_LAMBDA_ITER_DEFAULT        17
 #define ABS(a)	((a)>=0?(a):-(a))
 
-long gcd(long a, long b);
+int gcd(int a, int b);
 int4 BlastScoreChk(int4 lo, int4 hi);
 
 double BlastKarlinLHtoK(double* sfp, int4 min, int4 max, double lambda, double H)
@@ -396,9 +396,9 @@ double BlastKarlinLtoH(double* sfp, int4 min, int4 max, double lambda)
    	return lambda * av;
 }
 
-long gcd(long a, long b)
+int gcd(int a, int b)
 {
-	long c;
+	int c;
 
 	b = ABS(b);
 	if (b > a)

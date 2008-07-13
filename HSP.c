@@ -27,6 +27,8 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <emmintrin.h>
+#include <mmintrin.h>
 #include "TextConverter.h"
 #include "MiscUtilities.h"
 #include "Socket.h"
@@ -102,7 +104,7 @@ void HSPFillScoringMatrix(int scoringMatrix[16][16], const int matchScore, const
 
 }
 
-HSP *HSPLoad(MMPool *mmPool, const char *PackedDNAFileName, const char *AnnotationFileName, const char *AmbiguityFileName) {
+HSP *HSPLoad(MMPool *mmPool, const char *PackedDNAFileName, const char *AnnotationFileName, const char *AmbiguityFileName, const unsigned int trailerBufferInWord) {
 
 	HSP *hsp;
 	unsigned int dnaLength;
@@ -117,7 +119,7 @@ HSP *HSPLoad(MMPool *mmPool, const char *PackedDNAFileName, const char *Annotati
 
 	// Load packed DNA
 	if (PackedDNAFileName != NULL && PackedDNAFileName[0] != '\0' && PackedDNAFileName[0] != '-') {
-		hsp->packedDNA = DNALoadPacked(PackedDNAFileName, &hsp->dnaLength, TRUE);
+		hsp->packedDNA = DNALoadPacked(PackedDNAFileName, &hsp->dnaLength, TRUE, trailerBufferInWord);
 	} else {
 		hsp->packedDNA = NULL;
 		hsp->dnaLength = 0;
@@ -404,10 +406,10 @@ HSP *HSPConvertFromText(MMPool *mmPool, const unsigned char *text, const unsigne
 
 }
 
-void HSPFree(MMPool *mmPool, HSP *hsp) {
+void HSPFree(MMPool *mmPool, HSP *hsp, const unsigned int trailerBufferInWord) {
 
 	if (hsp->packedDNA != NULL) {
-		DNAFreePacked(hsp->packedDNA, hsp->dnaLength);
+		DNAFreePacked(hsp->packedDNA, hsp->dnaLength, trailerBufferInWord);
 	}
 	MMUnitFree(hsp->seqOffset, (hsp->numOfSeq+1) * sizeof(SeqOffset));
 	MMUnitFree(hsp->annotation, (hsp->numOfSeq+1) * sizeof(Annotation));
@@ -570,12 +572,15 @@ unsigned int HSPParseFASTAToPacked(const char* FASTAFileName, const char* annota
 		numSeq++;
 
 	}
-	numAmbiguity++;
 
 	// Finish reading FASTA file
 	fclose(FASTAFile);
 
+
 	// Finalize packed DNA file
+
+	numAmbiguity++;
+
 	if (numCharInBuffer > 0) {
 		ConvertTextToBytePacked(buffer, packedBuffer, charMap, 4, numCharInBuffer);
 		fwrite(packedBuffer, 1, (numCharInBuffer + 3) / 4, packedDNAFile);
@@ -610,6 +615,7 @@ unsigned int HSPParseFASTAToPacked(const char* FASTAFileName, const char* annota
 	// Output ambiguity file
 	fprintf(ambiguityFile, "%u %u %u\n", totalNumChar, numSeq, numAmbiguity);
 	for (i=0; i<numAmbiguity; i++) {
+		// The ambiguity for the dummy length is visible
 		fprintf(ambiguityFile, "%u %u %c\n", ambiguity[i].startPos, ambiguity[i].rightOfEndPos - ambiguity[i].startPos + 1, dnaChar[ambiguity[i].symbol]);
 	}
 	fclose(ambiguityFile);
@@ -625,7 +631,7 @@ unsigned int HSPPackedToFASTA(const char* FASTAFileName, const char* annotationF
 	HSP *hsp;
 	FILE *FASTAFile;
 
-	hsp = HSPLoad(NULL, packedDNAFileName, annotationFileName, ambiguityFileName);
+	hsp = HSPLoad(NULL, packedDNAFileName, annotationFileName, ambiguityFileName, 1);
 
 	// Generate FASTA from packed
 	FASTAFile = (FILE*)fopen64(FASTAFileName, "w");
@@ -639,12 +645,222 @@ unsigned int HSPPackedToFASTA(const char* FASTAFileName, const char* annotationF
 
 	fclose(FASTAFile);
 
-	HSPFree(NULL, hsp);
+	HSPFree(NULL, hsp, 1);
 
 	return 0;
 
 }
 
+// The hit must be an mismatch hit anchored on the left most of the pattern
+/*
+unsigned int HSPShortPattern1GapRightExt(const unsigned LONG *packedDNA, const unsigned char *pattern,
+						const unsigned int patternLength, const unsigned int textLength,
+						HitList* __restrict hitList, const unsigned int numHit, 
+						const unsigned int maxSpaceInGap, const unsigned int *maxMismatch) {
+
+	unsigned int anchorLength;
+	unsigned int maxSpaceInGap;
+	unsigned int maxMismatch[MAX_SP_SPACE_IN_GAP];
+
+	unsigned LONG anchorText, anchorPattern;
+	unsigned LONG nonAnchorText, nonAnchorPattern;
+	unsigned LONG nonAnchorTextReversed, nonAnchorPatternReversed;
+	unsigned int pos, shift, index;
+	unsigned maxRightShift;
+	unsigned int anchorNumError;
+	unsigned int nonAnchorError[MAX_SP_MISMATCH];
+	unsigned int leftShiftError[MAX_SP_MISMATCH];
+	unsigned int rightShiftError[MAX_SP_MISMATCH];
+
+	__m128i t;
+	__m128i m0, m1, m3, m0f, m00ff, m0000ffff;
+	__m128i ts, tn, p, mb, mb1, mp, mneg, mb31, md;
+
+	unsigned LONG ALIGN_16 temp[2];
+	unsigned int numExtHit;
+	const unsigned char *thisPattern;
+
+
+	const static int bitPos[32] = {  0, 16, 14,  1, 30,  7, 12, 17, 15, 11, 10, 23, 28, 24,  2,  4, 
+									31, 29, 22, 27, 26, 25,  8, 19, 13,  6,  9,  3, 21, 18,  5, 20  };
+
+	unsigned int i, h;
+
+	if (patternLength >= MAX_SP_NON_ANCHOR_LENGTH) {
+		anchorLength = patternLength - MAX_SP_NON_ANCHOR_LENGTH;
+	} else {
+		anchorLength = 0;
+	}
+
+	// Determine maximum no. of spaces and maximum mismatch corresponding to the no. of spaces
+	if (maxPenalty >= gapOpenScore) {
+		maxSpaceInGap = (maxPenalty - gapOpenScore) / gapExtendScore;
+	} else {
+		maxSpaceInGap = 0;
+	}
+
+	for (i=0; i<MAX_SP_SPACE_IN_GAP; i++) {
+		maxMismatch[i] = 0;
+	}
+	for (i=0; i<maxSpaceInGap; i++) {
+		maxMismatch[i] = (maxPenalty - gapOpenScore - gapOpenScore * i) / (matchScore - mismatchScore);
+	}
+
+	numExtHit = 0;
+
+	for (h=0; h<numHit; h++) {
+
+		thisPattern = pattern + patternLength * hitList[h].info;
+		if (hitList[h].posText + patternLength <= textLength) {
+			maxRightShift = textLength - hitList[h].posText - patternLength;
+			if (maxRightShift > MAX_SP_SPACE_IN_GAP) {
+				maxRightShift = MAX_SP_SPACE_IN_GAP;
+			}
+		} else {
+			continue;
+		} 
+
+		anchorNumError = 0;
+
+		anchorPattern = 0;
+		for (i=0; i<anchorLength; i++) {
+			anchorPattern <<= 2;
+			anchorPattern |= thisPattern[i];
+		}
+
+		nonAnchorPattern = 0;
+		for (; i<patternLength; i++) {
+			nonAnchorPattern <<= 2;
+			nonAnchorPattern |= thisPattern[i];
+		}
+
+		nonAnchorPatternReversed = 0;	// reverse pattern
+		for (i=patternLength; --i;) {	// from patternLength - 1 to 0
+			nonAnchorPatternReversed <<= 2;
+			nonAnchorPatternReversed |= thisPattern[i];
+		}
+
+		shift = hitList[h].posText % CHAR_PER_64;
+		pos = hitList[h].posText / CHAR_PER_64;
+		if (shift) {
+			anchorText = (packedDNA[pos] << shift) + (packedDNA[pos + 1] >> (64 - shift));
+		} else {
+			anchorText = packedDNA[pos / CHAR_PER_64];
+		}
+
+		shift = (hitList[h].posText + anchorLength - MAX_SP_SPACE_IN_GAP) % CHAR_PER_64;
+		pos = (hitList[h].posText + anchorLength - MAX_SP_SPACE_IN_GAP) / CHAR_PER_64;
+		if (shift) {
+			nonAnchorText = (packedDNA[pos] << shift) + (packedDNA[pos + 1] >> (64 - shift));
+		} else {
+			nonAnchorText = packedDNA[pos / CHAR_PER_64];
+		}
+
+		// Reverse nonAnchorText and nonAnchorPattern
+		temp[0] = nonAnchorText;
+		temp[1] = nonAnchorPattern;
+		t = _mm_load_si128((__m128i*)temp);
+		m3 = _mm_set1_epi32(0x33333333);
+		m0f = _mm_set1_epi32(0x0f0f0f0f);
+		m00ff = _mm_set1_epi32(0x00ff00ff);
+		m0000ffff = _mm_set1_epi32(0x0000ffff);
+
+		ts = _mm_srli_epi64(t, 2);
+		ts = _mm_and_si128(ts, m3);
+		tn = _mm_and_si128(t, m3);
+		tn = _mm_srli_epi64(tn, 2);
+		t = _mm_or_si128(ts, tn);
+
+		ts = _mm_srli_epi64(t, 4);
+		ts = _mm_and_si128(ts, m0f);
+		tn = _mm_and_si128(t, m0f);
+		tn = _mm_srli_epi64(tn, 4);
+		t = _mm_or_si128(ts, tn);
+
+		ts = _mm_srli_epi64(t, 8);
+		ts = _mm_and_si128(ts, m00ff);
+		tn = _mm_and_si128(t, m00ff);
+		tn = _mm_srli_epi64(tn, 8);
+		t = _mm_or_si128(ts, tn);
+
+		ts = _mm_srli_epi64(t, 16);
+		ts = _mm_and_si128(ts, m0000ffff);
+		tn = _mm_and_si128(t, m0000ffff);
+		tn = _mm_srli_epi64(tn, 16);
+		t = _mm_or_si128(ts, tn);
+
+		ts = _mm_srli_epi64(t, 32);
+		tn = _mm_srli_epi64(tn, 32);
+		t = _mm_or_si128(ts, tn);
+
+		_mm_store_si128((__m128i*)temp, t);
+		nonAnchorTextReversed = temp[0];
+		nonAnchorPatternReversed = temp[1];
+
+		m1 = _mm_set1_epi32(0xFFFFFFFF);
+		m0 = _mm_setzero_si128();
+
+		// Find the mismatches for anchor and non-anchor no-shift
+		temp[0] = anchorText;
+		temp[1] = nonAnchorTextReversed;
+		t = _mm_load_si128((__m128i*)temp);
+		temp[0] = anchorPattern;
+		temp[1] = nonAnchorPatternReversed;
+		p = _mm_load_si128((__m128i*)temp);
+		mb = _mm_and_si128(t, p);
+		mb1 = _mm_srli_epi64(mb, 1);
+		mb = _mm_and_si128(mb, mb1);
+		mb = _mm_andnot_si128(mb, m1);
+		
+		mneg = _mm_sub_epi64(m0, mb);
+		mb = _mm_and_si128(mb, mneg);
+
+		mb31 = _mm_srli_epi64(mb, 31);
+		mb = _mm_and_si128(mb, mb31);
+
+		md = _mm_set1_epi32(0x077CB531);
+		mp = _mm_mul_epu32(mb, md);
+		mp = _mm_srli_epi32(mp, 27);
+		
+		index = _mm_extract_epi16(mp, 0);
+		anchorNumError += (index > 0);
+
+		index = _mm_extract_epi16(mp, 4);
+		nonAnchorError[0] = bitPos[index];
+
+		// Continue with error 2 and 3
+
+		
+		// Find the mismatches for non-anchor 1-shift
+
+		// Find the mismatches for non-anchor 2-shift
+
+		// Find the mismatches for non-anchor 3-shift
+
+	}
+
+
+	// Find mismatches in non-anchor non-shift comparison
+
+	// Find mismatches in non-anchor left-shift comparison
+
+	// Find mismatches in non-anchor right-shift comparison
+
+	// Check spaces and mismatches
+
+
+	
+	// reverse the text and the pattern
+
+	// v = (v64 >> 31) | v64
+
+
+	// bitPos[((v & -v) * 0x077CB531UL) >> 27];
+
+
+
+}
+*/
 
 unsigned int HSPUngappedExtension(const unsigned int *packedDNA, const unsigned int *packedKey, const unsigned int *packedMask, const unsigned int queryPatternLength, 
 						 const unsigned int subPattenLength, const unsigned int textLength,
@@ -1789,18 +2005,20 @@ int HSPGappedExtensionWithTraceback(const unsigned int *packedDNA, const unsigne
 
 			// Store alignment and auxiliary text
 			numOfAlignmentWord = (forwardNumOfAlignment + backwardNumOfAlignment + ALIGN_PER_WORD - 1) / ALIGN_PER_WORD;
-			alignment = MMPoolDispatch(alignmentPool, numOfAlignmentWord * sizeof(unsigned int));
+			((GappedHitListWithAlignment*)(gappedHitList + numberOfGappedHit))->alignmentOffset = MMPoolDispatchOffset(alignmentPool, numOfAlignmentWord * sizeof(unsigned int));
+			alignment = (unsigned int*)((char*)alignmentPool + ((GappedHitListWithAlignment*)(gappedHitList + numberOfGappedHit))->alignmentOffset);
 			for (i=0; i<numOfAlignmentWord; i++) {
 				alignment[i] = 0;
 			}
 			if (forwardNumOfAuxiliaryText + backwardNumOfAuxiliaryText > 0) {
 				numOfAuxiliaryTextWord = (forwardNumOfAuxiliaryText + backwardNumOfAuxiliaryText + AUX_TEXT_PER_WORD - 1) / AUX_TEXT_PER_WORD;
-				auxiliaryText = MMPoolDispatch(alignmentPool, numOfAuxiliaryTextWord * sizeof(unsigned int));
+				((GappedHitListWithAlignment*)(gappedHitList + numberOfGappedHit))->auxiliaryTextOffset = MMPoolDispatchOffset(alignmentPool, numOfAuxiliaryTextWord * sizeof(unsigned int));
+				auxiliaryText = (unsigned int*)((char*)alignmentPool + ((GappedHitListWithAlignment*)(gappedHitList + numberOfGappedHit))->auxiliaryTextOffset);
 				for (i=0; i<numOfAuxiliaryTextWord; i++) {
 					auxiliaryText[i] = 0;
 				}
 			} else {
-				auxiliaryText = NULL;
+				((GappedHitListWithAlignment*)(gappedHitList + numberOfGappedHit))->auxiliaryTextOffset = 0;
 			}
 
 			// backward alignment
@@ -1821,9 +2039,6 @@ int HSPGappedExtensionWithTraceback(const unsigned int *packedDNA, const unsigne
 																				   << (BITS_IN_WORD - ((i+backwardNumOfAuxiliaryText) % AUX_TEXT_PER_WORD + 1) * AUX_TEXT_BIT));
 			}
 			
-			((GappedHitListWithAlignment*)(gappedHitList + numberOfGappedHit))->alignment = alignment;
-			((GappedHitListWithAlignment*)(gappedHitList + numberOfGappedHit))->auxiliaryText = auxiliaryText;
-
 			numberOfGappedHit++;
 
 		}
@@ -1949,6 +2164,9 @@ int HSPDPDBvsQuery(const unsigned int *packedText, const HitList *textList, cons
 	int bestScore, insertScore, deleteScore;
 
 	int minAlignmentLength, minNegAlignmentLength, maxDPGroupingDist;
+
+	unsigned int* __restrict alignment;
+	unsigned int* __restrict auxiliaryText;
 
 	// allocate working memory
 	dpCell = MMPoolDispatch(mmPool, 2 * sizeof(DPCell*));
@@ -2501,26 +2719,28 @@ int HSPDPDBvsQuery(const unsigned int *packedText, const HitList *textList, cons
 				gappedHitList[numOfGappedHit].dbSeqIndex = textDbSeqIndex;
 
 				numOfAlignmentWord = (tempAlignmentIndex + ALIGN_PER_WORD - 1) / ALIGN_PER_WORD;
-				gappedHitList[numOfGappedHit].alignment = MMPoolDispatch(alignmentPool, numOfAlignmentWord * sizeof(unsigned int));
+				gappedHitList[numOfGappedHit].alignmentOffset = MMPoolDispatchOffset(alignmentPool, numOfAlignmentWord * sizeof(unsigned int));
+				alignment = (unsigned int*)((char*)alignmentPool + gappedHitList[numOfGappedHit].alignmentOffset);
 				for (i=0; i<numOfAlignmentWord; i++) {
-					gappedHitList[numOfGappedHit].alignment[i] = 0;
+					alignment[i] = 0;
 				}
 
 				for (i=0; i<tempAlignmentIndex; i++) {
-					gappedHitList[numOfGappedHit].alignment[i/ALIGN_PER_WORD] |= (tempAlignment[i] << (BITS_IN_WORD - (i % ALIGN_PER_WORD + 1) * ALIGN_BIT));
+					alignment[i/ALIGN_PER_WORD] |= (tempAlignment[i] << (BITS_IN_WORD - (i % ALIGN_PER_WORD + 1) * ALIGN_BIT));
 				}
 
 				if (tempAuxiliaryTextIndex > 0) {
 					numOfAuxiliaryTextWord = (tempAuxiliaryTextIndex + AUX_TEXT_PER_WORD - 1) / AUX_TEXT_PER_WORD;
-					gappedHitList[numOfGappedHit].auxiliaryText = MMPoolDispatch(alignmentPool, numOfAuxiliaryTextWord * sizeof(unsigned int));
+					gappedHitList[numOfGappedHit].auxiliaryTextOffset = MMPoolDispatchOffset(alignmentPool, numOfAuxiliaryTextWord * sizeof(unsigned int));
+					auxiliaryText = (unsigned int*)((char*)alignmentPool + gappedHitList[numOfGappedHit].auxiliaryTextOffset);
 					for (i=0; i<numOfAuxiliaryTextWord; i++) {
-						gappedHitList[numOfGappedHit].auxiliaryText[i] = 0;
+						auxiliaryText[i] = 0;
 					}
 					for (i=0; i<tempAuxiliaryTextIndex; i++) {
-						gappedHitList[numOfGappedHit].auxiliaryText[i/AUX_TEXT_PER_WORD] |= (tempAuxiliaryText[i] << (BITS_IN_WORD - (i % AUX_TEXT_PER_WORD + 1) * AUX_TEXT_BIT));
+						auxiliaryText[i/AUX_TEXT_PER_WORD] |= (tempAuxiliaryText[i] << (BITS_IN_WORD - (i % AUX_TEXT_PER_WORD + 1) * AUX_TEXT_BIT));
 					}
 				} else {
-					gappedHitList[numOfGappedHit].auxiliaryText = NULL;
+					gappedHitList[numOfGappedHit].auxiliaryTextOffset = 0;
 				}
 
 				numOfGappedHit++;
@@ -2588,7 +2808,7 @@ unsigned int HSPSplitCrossBoundaryGappedHit(GappedHitList* __restrict gappedHitL
 	unsigned int oldHitLength;
 	unsigned int newHitLength;
 	unsigned int hitEnd;
-	long long diagonalPos;
+	LONG diagonalPos;
 
 
 	minHitLength = (cutoffScore + matchScore - 1) / matchScore;
@@ -2606,7 +2826,7 @@ unsigned int HSPSplitCrossBoundaryGappedHit(GappedHitList* __restrict gappedHitL
 			dbSeqIndex++;
 		}
 		gappedHitList[i].dbSeqIndex = dbSeqIndex;
-		diagonalPos = (long long)gappedHitList[i].ungappedPosText - (long long)gappedHitList[i].ungappedPosQuery;
+		diagonalPos = (LONG)gappedHitList[i].ungappedPosText - (LONG)gappedHitList[i].ungappedPosQuery;
 		oldHitLength = gappedHitList[i].lengthText;
 
 		splitDbSeqIndex = dbSeqIndex + 1;
@@ -2616,7 +2836,7 @@ unsigned int HSPSplitCrossBoundaryGappedHit(GappedHitList* __restrict gappedHitL
 			
 			gappedHitList[numberOfHit + numberOfSplitHit].posText = seqOffset[splitDbSeqIndex].startPos;
 			if (gappedHitList[numberOfHit + numberOfSplitHit].posText - diagonalPos < queryPatternLength) {
-				gappedHitList[numberOfHit + numberOfSplitHit].posQuery = (unsigned int)((long long)gappedHitList[numberOfHit + numberOfSplitHit].posText - diagonalPos);
+				gappedHitList[numberOfHit + numberOfSplitHit].posQuery = (unsigned int)((LONG)gappedHitList[numberOfHit + numberOfSplitHit].posText - diagonalPos);
 			} else {
 				gappedHitList[numberOfHit + numberOfSplitHit].posQuery = queryPatternLength - 1;
 			}
@@ -2644,7 +2864,7 @@ unsigned int HSPSplitCrossBoundaryGappedHit(GappedHitList* __restrict gappedHitL
 			} else if (gappedHitList[numberOfHit + numberOfSplitHit].ungappedPosText - diagonalPos >= queryPatternLength) {
 				gappedHitList[numberOfHit + numberOfSplitHit].ungappedPosQuery = queryPatternLength - 1;
 			} else {
-				gappedHitList[numberOfHit + numberOfSplitHit].ungappedPosQuery = (unsigned int)((long long)gappedHitList[numberOfHit + numberOfSplitHit].ungappedPosText - diagonalPos);
+				gappedHitList[numberOfHit + numberOfSplitHit].ungappedPosQuery = (unsigned int)((LONG)gappedHitList[numberOfHit + numberOfSplitHit].ungappedPosText - diagonalPos);
 			}
 
 			if (gappedHitList[i].ungappedPosText >= seqOffset[splitDbSeqIndex].startPos &&
@@ -2667,7 +2887,7 @@ unsigned int HSPSplitCrossBoundaryGappedHit(GappedHitList* __restrict gappedHitL
 		if (gappedHitList[i].posText < seqOffset[dbSeqIndex].startPos) {
 			gappedHitList[i].posText = seqOffset[dbSeqIndex].startPos;
 			if (gappedHitList[i].posText - diagonalPos < queryPatternLength) {
-				gappedHitList[i].posQuery = (int)((long long)gappedHitList[i].posText - diagonalPos);
+				gappedHitList[i].posQuery = (int)((LONG)gappedHitList[i].posText - diagonalPos);
 			} else {
 				gappedHitList[i].posQuery = queryPatternLength - 1;
 			}
@@ -2692,7 +2912,7 @@ unsigned int HSPSplitCrossBoundaryGappedHit(GappedHitList* __restrict gappedHitL
 		} else if (gappedHitList[i].ungappedPosText - diagonalPos >= queryPatternLength) {
 			gappedHitList[i].ungappedPosQuery = queryPatternLength - 1;
 		} else {
-			gappedHitList[i].ungappedPosQuery = (int)((long long)gappedHitList[i].ungappedPosText - diagonalPos);
+			gappedHitList[i].ungappedPosQuery = (int)((LONG)gappedHitList[i].ungappedPosText - diagonalPos);
 		}
 
 		if (gappedHitList[i].ungappedPosText >= seqOffset[dbSeqIndex].startPos &&
@@ -2758,16 +2978,16 @@ unsigned int HSPFinalFilter(GappedHitListWithAlignment* __restrict gappedHitList
 
 	j = 0;
 	while (j<hitRemaining) {
-		if (gappedHitList[j].alignment != NULL) {	// not marked as discarded
+		if (gappedHitList[j].alignmentOffset != 0) {	// not marked as discarded
 			i = j + 1;
 			while (i<hitRemaining && gappedHitList[i].posText == gappedHitList[j].posText
 								  && gappedHitList[i].posQuery == gappedHitList[j].posQuery) {
-				if (gappedHitList[i].alignment != NULL) {
+				if (gappedHitList[i].alignmentOffset != 0) {
 					if (gappedHitList[i].lengthText >= gappedHitList[j].lengthText &&
 						gappedHitList[i].lengthQuery >= gappedHitList[j].lengthQuery &&
 						gappedHitList[i].score <= gappedHitList[j].score) {
 						// discard hit
-						gappedHitList[i].alignment = NULL;
+						gappedHitList[i].alignmentOffset = 0;
 					}
 				}
 				i++;
@@ -2779,15 +2999,15 @@ unsigned int HSPFinalFilter(GappedHitListWithAlignment* __restrict gappedHitList
 	// Pack retained hit to the beginning
 	i = j = 0;
 	while (i<hitRemaining) {
-		if (gappedHitList[i].alignment != NULL) {	// not marked as discarded
+		if (gappedHitList[i].alignmentOffset != 0) {	// not marked as discarded
 			gappedHitList[j].posText = gappedHitList[i].posText;
 			gappedHitList[j].posQuery = gappedHitList[i].posQuery;
 			gappedHitList[j].lengthText = gappedHitList[i].lengthText;
 			gappedHitList[j].lengthQuery = gappedHitList[i].lengthQuery;
 			gappedHitList[j].score = gappedHitList[i].score;
 			gappedHitList[j].dbSeqIndex = gappedHitList[i].dbSeqIndex;
-			gappedHitList[j].alignment = gappedHitList[i].alignment;
-			gappedHitList[j].auxiliaryText = gappedHitList[i].auxiliaryText;
+			gappedHitList[j].alignmentOffset = gappedHitList[i].alignmentOffset;
+			gappedHitList[j].auxiliaryTextOffset = gappedHitList[i].auxiliaryTextOffset;
 			j++;
 		}
 		i++;
@@ -2801,16 +3021,16 @@ unsigned int HSPFinalFilter(GappedHitListWithAlignment* __restrict gappedHitList
 
 	j = 0;
 	while (j<hitRemaining) {
-		if (gappedHitList[j].alignment != NULL) {	// not marked as discarded
+		if (gappedHitList[j].alignmentOffset != 0) {	// not marked as discarded
 			i = j + 1;
 			while (i<hitRemaining && gappedHitList[i].posText + gappedHitList[i].lengthText == gappedHitList[j].posText + gappedHitList[j].lengthText 
 							  && gappedHitList[i].posQuery + gappedHitList[i].lengthQuery == gappedHitList[j].posQuery + gappedHitList[j].lengthQuery) {
-				if (gappedHitList[i].alignment != NULL) {
+				if (gappedHitList[i].alignmentOffset != 0) {
 					if (gappedHitList[i].lengthText >= gappedHitList[j].lengthText &&
 						gappedHitList[i].lengthQuery >= gappedHitList[j].lengthQuery &&
 						gappedHitList[i].score <= gappedHitList[j].score) {
 						// discard hit
-						gappedHitList[i].alignment = NULL;
+						gappedHitList[i].alignmentOffset = 0;
 					}
 				}
 				i++;
@@ -2822,15 +3042,15 @@ unsigned int HSPFinalFilter(GappedHitListWithAlignment* __restrict gappedHitList
 	// Pack retained hit to the beginning
 	i = j = 0;
 	while (i<hitRemaining) {
-		if (gappedHitList[i].alignment != NULL) {	// not marked as discarded
+		if (gappedHitList[i].alignmentOffset != 0) {	// not marked as discarded
 			gappedHitList[j].posText = gappedHitList[i].posText;
 			gappedHitList[j].posQuery = gappedHitList[i].posQuery;
 			gappedHitList[j].lengthText = gappedHitList[i].lengthText;
 			gappedHitList[j].lengthQuery = gappedHitList[i].lengthQuery;
 			gappedHitList[j].score = gappedHitList[i].score;
 			gappedHitList[j].dbSeqIndex = gappedHitList[i].dbSeqIndex;
-			gappedHitList[j].alignment = gappedHitList[i].alignment;
-			gappedHitList[j].auxiliaryText = gappedHitList[i].auxiliaryText;
+			gappedHitList[j].alignmentOffset = gappedHitList[i].alignmentOffset;
+			gappedHitList[j].auxiliaryTextOffset = gappedHitList[i].auxiliaryTextOffset;
 			j++;
 		}
 		i++;
@@ -2850,13 +3070,13 @@ unsigned int HSPFinalFilter(GappedHitListWithAlignment* __restrict gappedHitList
 		gappedHitList[j].lengthQuery = gappedHitList[i].lengthQuery;
 		gappedHitList[j].score = gappedHitList[i].score;
 		gappedHitList[j].dbSeqIndex = gappedHitList[i].dbSeqIndex;
-		gappedHitList[j].alignment = gappedHitList[i].alignment;
-		gappedHitList[j].auxiliaryText = gappedHitList[i].auxiliaryText;
+		gappedHitList[j].alignmentOffset = gappedHitList[i].alignmentOffset;
+		gappedHitList[j].auxiliaryTextOffset = gappedHitList[i].auxiliaryTextOffset;
 		i++;
 		while (i<hitRemaining && gappedHitList[i].posText == gappedHitList[j].posText 
 							  && gappedHitList[i].posQuery == gappedHitList[j].posQuery) {
 			// discard hit
-			gappedHitList[i].alignment = NULL;
+			gappedHitList[i].alignmentOffset = 0;
 			i++;
 		}
 		j++;
@@ -2876,13 +3096,13 @@ unsigned int HSPFinalFilter(GappedHitListWithAlignment* __restrict gappedHitList
 		gappedHitList[j].lengthQuery = gappedHitList[i].lengthQuery;
 		gappedHitList[j].score = gappedHitList[i].score;
 		gappedHitList[j].dbSeqIndex = gappedHitList[i].dbSeqIndex;
-		gappedHitList[j].alignment = gappedHitList[i].alignment;
-		gappedHitList[j].auxiliaryText = gappedHitList[i].auxiliaryText;
+		gappedHitList[j].alignmentOffset = gappedHitList[i].alignmentOffset;
+		gappedHitList[j].auxiliaryTextOffset = gappedHitList[i].auxiliaryTextOffset;
 		i++;
 		while (i<hitRemaining && gappedHitList[i].posText + gappedHitList[i].lengthText == gappedHitList[j].posText + gappedHitList[j].lengthText 
 							  && gappedHitList[i].posQuery + gappedHitList[i].lengthQuery == gappedHitList[j].posQuery + gappedHitList[j].lengthQuery) {
 			// discard hit
-			gappedHitList[i].alignment = NULL;
+			gappedHitList[i].alignmentOffset = 0;
 			i++;
 		}
 		j++;
@@ -2896,16 +3116,16 @@ unsigned int HSPFinalFilter(GappedHitListWithAlignment* __restrict gappedHitList
 
 	j = 0;
 	while (j<hitRemaining) {
-		if (gappedHitList[j].alignment != NULL) {	// not marked as discarded
+		if (gappedHitList[j].alignmentOffset != 0) {	// not marked as discarded
 			i = j + 1;
 			while (i<hitRemaining && gappedHitList[i].posText < gappedHitList[j].posText + gappedHitList[j].lengthText) {
-				if (gappedHitList[i].alignment != NULL) {
+				if (gappedHitList[i].alignmentOffset != 0) {
 					if (gappedHitList[i].posText + gappedHitList[i].lengthText <= gappedHitList[j].posText + gappedHitList[j].lengthText &&
 						gappedHitList[i].posQuery >= gappedHitList[j].posQuery &&
 						gappedHitList[i].posQuery + gappedHitList[i].lengthQuery <= gappedHitList[j].posQuery + gappedHitList[j].lengthQuery &&
 						gappedHitList[i].score <= gappedHitList[j].score) {
 						// discard hit
-						gappedHitList[i].alignment = NULL;
+						gappedHitList[i].alignmentOffset = 0;
 					}
 				}
 				i++;
@@ -2917,15 +3137,15 @@ unsigned int HSPFinalFilter(GappedHitListWithAlignment* __restrict gappedHitList
 	// Pack retained hit to the beginning
 	i = j = 0;
 	while (i<hitRemaining) {
-		if (gappedHitList[i].alignment != NULL) {	// not marked as discarded
+		if (gappedHitList[i].alignmentOffset != 0) {	// not marked as discarded
 			gappedHitList[j].posText = gappedHitList[i].posText;
 			gappedHitList[j].posQuery = gappedHitList[i].posQuery;
 			gappedHitList[j].lengthText = gappedHitList[i].lengthText;
 			gappedHitList[j].lengthQuery = gappedHitList[i].lengthQuery;
 			gappedHitList[j].score = gappedHitList[i].score;
 			gappedHitList[j].dbSeqIndex = gappedHitList[i].dbSeqIndex;
-			gappedHitList[j].alignment = gappedHitList[i].alignment;
-			gappedHitList[j].auxiliaryText = gappedHitList[i].auxiliaryText;
+			gappedHitList[j].alignmentOffset = gappedHitList[i].alignmentOffset;
+			gappedHitList[j].auxiliaryTextOffset = gappedHitList[i].auxiliaryTextOffset;
 			j++;
 		}
 		i++;
@@ -3198,11 +3418,11 @@ void HSPPrintQueryHeader(FILE *outputFile, const int outputFormat,
 
 }
 
-void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWithAlignment* gappedHitList, const int numOfHit, 
+void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, MMPool *alignmentPool, const GappedHitListWithAlignment* gappedHitList, const int numOfHit, 
 					   int outputFormat, const ContextInfo* contextInfo, 
 					   const unsigned char *charMap, const unsigned char *complementMap,
 					   const char* queryPatternName, const unsigned char* convertedQueryPattern, const int queryPatternLength,
-					   const int * dbOrder, const SeqOffset *seqOffset, const Annotation *annotation) {
+					   const int * dbOrder, const HSP *hsp) {
 
 	int i, j;
 	int lastDbSeqIndex, dbSeqIndex, contextNum;
@@ -3226,6 +3446,9 @@ void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWith
 	char lowercase[256];
 
 	int numOfMatch, numOfMismatch, numOfSpace, numOfGap;
+
+	unsigned int* __restrict alignment;
+	unsigned int* __restrict auxiliaryText;
 
 	// Allocate memory
 	tempDbChar = MMPoolDispatch(mmPool, MAX_ALIGNMENT_LENGTH + 1);
@@ -3270,12 +3493,12 @@ void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWith
 			case OUTPUT_PAIRWISE :
 
 				// Print header for sequence
-				if (annotation[dbSeqIndex].gi > 0) {
-					fprintf(outputFile, ">gi|%d|%s", annotation[dbSeqIndex].gi, annotation[dbSeqIndex].text);
+				if (hsp->annotation[dbSeqIndex].gi > 0) {
+					fprintf(outputFile, ">gi|%d|%s", hsp->annotation[dbSeqIndex].gi, hsp->annotation[dbSeqIndex].text);
 				} else {
-					fprintf(outputFile, ">%s", annotation[dbSeqIndex].text);
+					fprintf(outputFile, ">%s", hsp->annotation[dbSeqIndex].text);
 				}
-				fprintf(outputFile, "No. of letters   : %u\n", seqOffset[dbSeqIndex].endPos - seqOffset[dbSeqIndex].startPos + 1);
+				fprintf(outputFile, "No. of letters   : %u\n", hsp->seqOffset[dbSeqIndex].endPos - hsp->seqOffset[dbSeqIndex].startPos + 1);
 				fprintf(outputFile, "\n");
 
 				break;
@@ -3284,7 +3507,7 @@ void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWith
 			case OUTPUT_TABULAR_COMMENT :
 
 				// duplicate sequence name
-				strncpy(seqName, annotation[dbSeqIndex].text, MAX_SEQ_NAME_LENGTH+1);
+				strncpy(seqName, hsp->annotation[dbSeqIndex].text, MAX_SEQ_NAME_LENGTH+1);
 				// take the first white space as end of pattern name
 				for (j=0; j<MAX_SEQ_NAME_LENGTH; j++) {
 					if (seqName[j] == ' ' || seqName[j] == '\0' || seqName[j] == '\t' || seqName[j] == '\n') {
@@ -3312,9 +3535,12 @@ void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWith
 		lastA = -1;
 		c = 0;
 
+		alignment = (unsigned int*)((char*)alignmentPool + gappedHitList[i].alignmentOffset);
+		auxiliaryText = (unsigned int*)((char*)alignmentPool + gappedHitList[i].auxiliaryTextOffset);
+
 		while (queryIndex < gappedHitList[i].lengthQuery) {
 			if (totalLength % ALIGN_PER_WORD == 0) {
-				c = gappedHitList[i].alignment[totalLength / ALIGN_PER_WORD];
+				c = alignment[totalLength / ALIGN_PER_WORD];
 			}
 			a = (char)(c >> (BITS_IN_WORD - ALIGN_BIT));
 			c <<= ALIGN_BIT;
@@ -3330,7 +3556,7 @@ void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWith
 				queryIndex++;
 				break;
 			case ALIGN_MISMATCH_AMBIGUITY :
-				tempDbChar[totalLength] = dnaChar[(gappedHitList[i].auxiliaryText[auxiliaryTextIndex / AUX_TEXT_PER_WORD] << ((auxiliaryTextIndex % AUX_TEXT_PER_WORD) * AUX_TEXT_BIT) >> (BITS_IN_WORD - AUX_TEXT_BIT))];
+				tempDbChar[totalLength] = dnaChar[(auxiliaryText[auxiliaryTextIndex / AUX_TEXT_PER_WORD] << ((auxiliaryTextIndex % AUX_TEXT_PER_WORD) * AUX_TEXT_BIT) >> (BITS_IN_WORD - AUX_TEXT_BIT))];
 				if (contextInfo[contextNum].reversed) {
 					tempDbChar[totalLength] = complementMap[tempDbChar[totalLength]];
 					tempQueryChar[totalLength] = dnaChar[convertedQueryPattern[queryPatternLength - 1 - queryIndex - gappedHitList[i].posQuery]];
@@ -3352,7 +3578,7 @@ void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWith
 				auxiliaryTextIndex++;
 				break;
 			case ALIGN_INSERT :
-				tempDbChar[totalLength] = dnaChar[(gappedHitList[i].auxiliaryText[auxiliaryTextIndex / AUX_TEXT_PER_WORD] << ((auxiliaryTextIndex % AUX_TEXT_PER_WORD) * AUX_TEXT_BIT) >> (BITS_IN_WORD - AUX_TEXT_BIT))];
+				tempDbChar[totalLength] = dnaChar[(auxiliaryText[auxiliaryTextIndex / AUX_TEXT_PER_WORD] << ((auxiliaryTextIndex % AUX_TEXT_PER_WORD) * AUX_TEXT_BIT) >> (BITS_IN_WORD - AUX_TEXT_BIT))];
 				if (contextInfo[contextNum].reversed) {
 					tempDbChar[totalLength] = complementMap[tempDbChar[totalLength]];
 				}
@@ -3401,7 +3627,7 @@ void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWith
 			fprintf(outputFile, "\n\n");
 
 			// Determine position length and format
-			c = gappedHitList[i].posText + gappedHitList[i].lengthText - seqOffset[dbSeqIndex].startPos;
+			c = gappedHitList[i].posText + gappedHitList[i].lengthText - hsp->seqOffset[dbSeqIndex].startPos;
 			textPosNumOfChar = 0;
 			while (c > 0) {
 				c /= 10;
@@ -3421,10 +3647,10 @@ void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWith
 			alignmentCharPrinted = 0;
 			if (contextInfo[contextNum].reversed) {
 				queryIndex = queryPatternLength + 1 - gappedHitList[i].posQuery - gappedHitList[i].lengthQuery;
-				dbIndex = gappedHitList[i].posText + gappedHitList[i].lengthText - seqOffset[dbSeqIndex].startPos;
+				dbIndex = gappedHitList[i].posText + gappedHitList[i].lengthText - hsp->seqOffset[dbSeqIndex].startPos;
 			} else {
 				queryIndex = gappedHitList[i].posQuery + 1;
-				dbIndex = gappedHitList[i].posText - seqOffset[dbSeqIndex].startPos + 1;
+				dbIndex = gappedHitList[i].posText - hsp->seqOffset[dbSeqIndex].startPos + 1;
 			}
 
 			while (alignmentCharPrinted < totalLength) {
@@ -3552,8 +3778,8 @@ void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWith
 			fprintf(outputFile, "%s\t", queryName);
 
 			// print gi
-			if (annotation[dbSeqIndex].gi > 0) {
-				fprintf(outputFile, "gi|%d|", annotation[dbSeqIndex].gi);
+			if (hsp->annotation[dbSeqIndex].gi > 0) {
+				fprintf(outputFile, "gi|%d|", hsp->annotation[dbSeqIndex].gi);
 			}
 
 			// print db sequence name
@@ -3582,11 +3808,11 @@ void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWith
 
 			// print text start and end
 			if (contextInfo[contextNum].reversed) {
-				fprintf(outputFile, "%u\t%u\t", gappedHitList[i].posText + gappedHitList[i].lengthText - seqOffset[dbSeqIndex].startPos,
-											   gappedHitList[i].posText + 1 - seqOffset[dbSeqIndex].startPos);
+				fprintf(outputFile, "%u\t%u\t", gappedHitList[i].posText + gappedHitList[i].lengthText - hsp->seqOffset[dbSeqIndex].startPos,
+											   gappedHitList[i].posText + 1 - hsp->seqOffset[dbSeqIndex].startPos);
 			} else {
-				fprintf(outputFile, "%u\t%u\t", gappedHitList[i].posText + 1 - seqOffset[dbSeqIndex].startPos,
-											   gappedHitList[i].posText + gappedHitList[i].lengthText - seqOffset[dbSeqIndex].startPos);
+				fprintf(outputFile, "%u\t%u\t", gappedHitList[i].posText + 1 - hsp->seqOffset[dbSeqIndex].startPos,
+											   gappedHitList[i].posText + gappedHitList[i].lengthText - hsp->seqOffset[dbSeqIndex].startPos);
 			}
 
 

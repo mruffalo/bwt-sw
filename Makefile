@@ -1,6 +1,6 @@
 DEFINE = 
 CC = gcc
-CFLAGS = -O3 -maccumulate-outgoing-args -m32
+CFLAGS = -O3 -funroll-loops -maccumulate-outgoing-args -Wall
 
 all:	BWTFormatdb BWTBlast BWTSW BlastCompare
 

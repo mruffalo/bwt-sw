@@ -257,10 +257,10 @@ int main(int argc, char** argv) {
 	double elapsedTime = 0, totalQueryTime = 0;
 	double databaseLoadTime, totalSearchTime, totalTextDecodeTime, totalUngappedExtensionTime, totalGappedExtensionTime1, totalGappedExtensionTime2, totalPrintTime;
 	double queryStartTime;
-	long long totalSaIndexRange, totalHitGenerated, totalUngappedHit, totalUniqueUngappedHit;
-	long long totalGappedHit, totalNonCrossBoundaryGappedHit, totalUniqueGappedHit;
-	long long totalGappedHitWithTraceback, totalFinalHit;
-	long long totalNumOfUnmaskedChar, totalNumOfChar;
+	LONG totalSaIndexRange, totalHitGenerated, totalUngappedHit, totalUniqueUngappedHit;
+	LONG totalGappedHit, totalNonCrossBoundaryGappedHit, totalUniqueGappedHit;
+	LONG totalGappedHitWithTraceback, totalFinalHit;
+	LONG totalNumOfUnmaskedChar, totalNumOfChar;
 
 	// Count Histogram statistic by score
 	Histogram *histogram;
@@ -458,7 +458,7 @@ int main(int argc, char** argv) {
 
 		// Open extra alignment file
 		if (AlignFileName[0] != ' ' && AlignFileName[0] != '-' && AlignFileName[0] != '\0') {
-			alignFile = fopen(AlignFileName, "w");
+			alignFile = fopen64(AlignFileName, "w");
 			if (alignFile == NULL) {
 				fprintf(stderr, "Cannot open alignment file %s!\n", AlignFileName);
 				exit(1);
@@ -469,7 +469,7 @@ int main(int argc, char** argv) {
 
 		// Open timing file
 		if (TimingFileName[0] != ' ' && TimingFileName[0] != '-' && TimingFileName[0] != '\0') {
-			timingFile = fopen(TimingFileName, "a");
+			timingFile = fopen64(TimingFileName, "a");
 			if (timingFile == NULL) {
 				fprintf(stderr, "Cannot open timing file %s!\n", TimingFileName);
 				exit(1);
@@ -485,7 +485,7 @@ int main(int argc, char** argv) {
 	fflush(stdout);
 
 	bwt = BWTLoad(mmPool, BWTCodeFileName, BWTOccValueFileName, SaValueFileName, NULL, SaIndexFileName, NULL);
-	hsp = HSPLoad(mmPool, PackedDNAFileName, AnnotationFileName, AmbiguityFileName);
+	hsp = HSPLoad(mmPool, PackedDNAFileName, AnnotationFileName, AmbiguityFileName, 1);
 	if (bwt->textLength != hsp->dnaLength) {
 		fprintf(stderr, "BWT-BLAST: Database length inconsistent!\n");
 		exit(1);
@@ -622,7 +622,7 @@ int main(int argc, char** argv) {
 
 			// Open extra alignment file
 			if (AlignFileName[0] != ' ' && AlignFileName[0] != '-' && AlignFileName[0] != '\0') {
-				alignFile = fopen(AlignFileName, "w");
+				alignFile = fopen64(AlignFileName, "w");
 				if (alignFile == NULL) {
 					Socketfprintf(stderr, "Cannot open alignment file %s!\n", AlignFileName);
 					SocketEndConnection(bwtServerSocket);
@@ -634,7 +634,7 @@ int main(int argc, char** argv) {
 
 			// Open timing file
 			if (TimingFileName[0] != ' ' && TimingFileName[0] != '-' && TimingFileName[0] != '\0') {
-				timingFile = fopen(TimingFileName, "a");
+				timingFile = fopen64(TimingFileName, "a");
 				if (timingFile == NULL) {
 					Socketfprintf(stderr, "Cannot open timing file %s!\n", TimingFileName);
 					SocketEndConnection(bwtServerSocket);
@@ -1053,7 +1053,7 @@ int main(int argc, char** argv) {
 		//			numOfSaIndexGroup = BWTSubPatternHammingDistSaIndex(bwt, maskedQueryPattern, queryPatternLength, SeedSkip,
 		//																&hitCombination,
 		//																saIndexRange, saIndexRangeNumOfChar,
-		//																saIndexGroup, (WorkingMemorySize - workingMemoryUsed) / sizeof(SaIndexGroupNew));																firstSaIndexGroupForSubPattern);
+		//																saIndexGroup, (WorkingMemorySize - workingMemoryUsed) / sizeof(SaIndexGroupNew));
 
 					totalSaIndexRange += numOfSaIndexGroup;
 
@@ -1250,17 +1250,17 @@ int main(int argc, char** argv) {
 				HSPCountEvalueToHistogram(histogram, finalHitListAllContext, numOfHitForQuery, TRUE);
 
 				// Print result
-				HSPPrintAlignment(workingMemoryPool, outputFile, finalHitListAllContext, numOfHitForQuery,
+				HSPPrintAlignment(workingMemoryPool, outputFile, alignmentPool, finalHitListAllContext, numOfHitForQuery,
 								  OutputFormat, contextInfo, 
 								  charMap, complementMap,
 								  queryPatternName, queryPattern, queryPatternLength,
-								  dbOrder, hsp->seqOffset, hsp->annotation);
+								  dbOrder, hsp);
 				if (alignFile != NULL) {
-					HSPPrintAlignment(workingMemoryPool, alignFile, finalHitListAllContext, numOfHitForQuery,
+					HSPPrintAlignment(workingMemoryPool, alignFile, alignmentPool, finalHitListAllContext, numOfHitForQuery,
 									  OUTPUT_PAIRWISE, contextInfo, 
 									  charMap, complementMap,
 									  queryPatternName, queryPattern, queryPatternLength,
-									  dbOrder, hsp->seqOffset, hsp->annotation);
+									  dbOrder, hsp);
 				}
 
 				// Alignment and auxiliary text are freed through alignmentPool
@@ -1326,7 +1326,10 @@ int main(int argc, char** argv) {
 			Socketprintf("Search time             = %9.4f s", totalSearchTime);
 			Socketprintf("   SA index range = %9lld\n", totalSaIndexRange);
 			Socketprintf("Text decode time        = %9.4f s", totalTextDecodeTime);
-			Socketprintf("   Hit generated  = %9lld (%lld)\n", totalHitGenerated, totalHitGenerated + bwtSaRetrievalStatistics.saDiagonalFiltered);
+			Socketprintf("   Hit generated  = %9lld (%lld)\n", totalHitGenerated, bwtSaRetrievalStatistics.bwtSaRetrieved + 
+																				  bwtSaRetrievalStatistics.saDiagonalLinked +
+																				  bwtSaRetrievalStatistics.saDuplicated +
+																				  bwtSaRetrievalStatistics.cachedSaRetrieved);
 			Socketprintf("Ungapped extension time = %9.4f s", totalUngappedExtensionTime);
 			Socketprintf("   Ungapped hit   = %9lld (%lld)\n", totalUniqueUngappedHit, totalUngappedHit);
 			Socketprintf("Gapped extension time 1 = %9.4f s", totalGappedExtensionTime1);
@@ -1377,7 +1380,7 @@ int main(int argc, char** argv) {
 
 	MMUnitFree(queryPattern, queryPatternAllocated);
 
-	HSPFree(mmPool, hsp);
+	HSPFree(mmPool, hsp, 1);
 	BWTFree(mmPool, bwt);
 
 	MMPoolFree(mmPool);
@@ -1397,6 +1400,7 @@ int main(int argc, char** argv) {
 dictionary *ParseInput(int argc, char** argv) {
 
 	dictionary *programInput;
+
 	char t1[3] = "-c";	// specify that this is a boolean type parameter; no following argument
 	char t2[3] = "-L";	// specify that this is a boolean type parameter; no following argument
 	char t3[3] = "-X";	// specify that this is a boolean type parameter; no following argument
@@ -1589,7 +1593,7 @@ void ParseIniFile(char *iniFileName) {
 	iniparser_copystring(ini, "Database:BWTCodeFileName", BWTCodeFileName, BWTCodeFileName, MAX_FILENAME_LEN);
 	iniparser_copystring(ini, "Database:BWTOccValueFileName", BWTOccValueFileName, BWTOccValueFileName, MAX_FILENAME_LEN);
 	iniparser_copystring(ini, "Database:SaValueFileName", SaValueFileName, SaValueFileName, MAX_FILENAME_LEN);
-	iniparser_copystring(ini, "Database:SaIndexFileName", SaIndexFileName, SaIndexFileName, MAX_FILENAME_LEN);
+	iniparser_copystring(ini, "Database:CachedSaIndexFileName", SaIndexFileName, SaIndexFileName, MAX_FILENAME_LEN);
 
 	iniparser_freedict(ini);
 

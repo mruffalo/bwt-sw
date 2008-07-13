@@ -75,8 +75,8 @@ void PackTextWithAllShift(const unsigned char *input, unsigned int **output, con
 // Full load function
 unsigned int ReadTextAsWordPacked(const char *inputFileName, const unsigned char *charMap, const unsigned int alphabetSize, unsigned int *targetAddress, const unsigned int maxTextLength);
 unsigned int ReadBytePackedAsWordPacked(const char *inputFileName, const unsigned int alphabetSize, unsigned int *targetAddress, const unsigned int maxTextLength);
-void *DNALoadPacked(const char *inputFileName, unsigned int *textLength, const unsigned int convertToWordPacked);
-void DNAFreePacked(void* packedDna, const unsigned int textLength);
+void *DNALoadPacked(const char *inputFileName, unsigned int *textLength, const unsigned int convertToWordPacked, const unsigned int trailerBufferInWord);
+void DNAFreePacked(void* packedDna, const unsigned int textLength, const unsigned int trailerBufferInWord);
 
 // Save functions
 void SaveText(const char *outputFileName, const unsigned char *text, const unsigned int textLength);

@@ -31,6 +31,8 @@
 
 #define ALPHABET_SIZE				4
 #define BIT_PER_CHAR				2
+#define CHAR_PER_128				64
+#define CHAR_PER_64					32
 #define CHAR_PER_WORD				16
 #define CHAR_PER_BYTE				4
 
@@ -101,8 +103,8 @@ typedef struct GappedHitListWithAlignment {
 	unsigned int lengthQuery;	// length of aligned query
 	int score;					// score of alignment
 	unsigned int dbSeqIndex;	// DB sequence
-	unsigned int *alignment;		// alignment; 2 bit per alignment for match, mismatch or ambigurous, insert, delete
-	unsigned int *auxiliaryText;	// text characters for mismatch, insert and ambigurous characters
+	unsigned int alignmentOffset;		// alignment; 2 bit per alignment for match, mismatch or ambigurous, insert, delete; offset to a memory pool
+	unsigned int auxiliaryTextOffset;	// text characters for mismatch, insert and ambigurous characters; offset to a memory pool
 } GappedHitListWithAlignment;
 
 typedef struct Context {
@@ -147,14 +149,14 @@ typedef struct Traceback {
 } Traceback;
 
 typedef struct HSP {
-	unsigned int* packedDNA;
 	int numOfSeq;
-	Annotation* annotation;
-	SeqOffset* seqOffset;
 	int numOfAmbiguity;
-	Ambiguity* ambiguity;
 	unsigned int dnaLength;
 	unsigned int minSeqLength;
+	unsigned int* packedDNA;
+	Annotation* annotation;
+	SeqOffset* seqOffset;
+	Ambiguity* ambiguity;
 } HSP;
 
 typedef struct DPCell {
@@ -208,6 +210,10 @@ typedef struct Histogram {
 #define AUX_TEXT_PER_WORD			8
 #define AUX_TEXT_BIT				4
 
+#define MAX_SP_SPACE_IN_GAP			3
+#define MAX_SP_MISMATCH				3
+#define MAX_SP_NON_ANCHOR_LENGTH	25	// MAX_SP_NON_ANCHOR_LENGTH + 2 * MAX_SP_SPACE_IN_GAP + 1 <= 32
+
 static const char lowercaseDnaCharIndex = 14;	// Seems that BLAST treat masked characters as 'N' (still have 1/4 chance of matching)
 static const char nonMatchDnaCharIndex  = 15;
 static const char dnaChar[16]			= {'A', 'C', 'G', 'T', 'M', 'R', 'S', 'V', 'W', 'Y', 'H', 'K', 'D', 'B', 'N', 'L'};
@@ -237,15 +243,22 @@ void HSPFillComplementMap(unsigned char complementMap[255]);
 // scoringMatrix must be allocated with scoringMatrix[16][16]
 void HSPFillScoringMatrix(int scoringMatrix[16][16], const int matchScore, const int mismatchScore, const int leftShift);
 
-HSP *HSPLoad(MMPool *mmPool, const char *PackedDNAFileName, const char *AnnotationFileName, const char *AmbiguityFileName);
+HSP *HSPLoad(MMPool *mmPool, const char *PackedDNAFileName, const char *AnnotationFileName, const char *AmbiguityFileName, const unsigned int trailerBufferInWord);
 HSP *HSPConvertFromText(MMPool *mmPool, const unsigned char *text, const unsigned int textLength, 
 						const unsigned int FASTARandomSeed, const int maskLowerCase,
 						const int gi, const char *seqName);
-void HSPFree(MMPool *mmPool, HSP *hsp);
+void HSPFree(MMPool *mmPool, HSP *hsp, const unsigned int trailerBufferInWord);
 
 unsigned int HSPParseFASTAToPacked(const char* FASTAFileName, const char* annotationFileName, const char* packedDNAFileName, const char* ambiguityFileName,
 					  const unsigned int FASTARandomSeed, const int maskLowerCase);
 unsigned int HSPPackedToFASTA(const char* FASTAFileName, const char* annotationFileName, const char* packedDNAFileName, const char* ambiguityFileName);
+
+unsigned int HSPShortPattern1GapRightExt(const unsigned LONG *packedDNA, const unsigned char *pattern,
+						const unsigned int patternLength, const unsigned int textLength,
+						HitList* __restrict hitList, const unsigned int numHit, 
+						const int matchScore, const int mismatchScore,
+						const int gapOpenScore, const int gapExtendScore,
+						const int maxPenalty);
 
 unsigned int HSPUngappedExtension(const unsigned int *packedDNA, const unsigned int *packedKey, const unsigned int *packedMask, const unsigned int queryPatternLength, 
 						 const unsigned int subPattenLength, const unsigned int textLength,
@@ -300,11 +313,11 @@ void HSPPrintTrailer(FILE *outputFile, const int outputFormat,
 void HSPPrintQueryHeader(FILE *outputFile, const int outputFormat,
 					   const char* queryPatternName, const int queryPatternLength,
 					   const int *dbOrder, const int *dbScore, const Annotation *annotation, const int numOfSeq);
-void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, const GappedHitListWithAlignment* gappedHitList, const int numOfHit, 
+void HSPPrintAlignment(MMPool *mmPool, FILE *outputFile, MMPool *alignmentPool, const GappedHitListWithAlignment* gappedHitList, const int numOfHit, 
 					   int outputFormat, const ContextInfo* contextInfo,
 					   const unsigned char *charMap, const unsigned char *complimentMap,
 					   const char* queryPatternName, const unsigned char* convertedQueryPattern, const int queryPatternLength,
-					   const int * dbOrder, const SeqOffset *seqOffset, const Annotation *annotation);
+					   const int * dbOrder, const HSP *hsp);
 void HSPPrintNoAlignment(FILE *outputFile, int outputFormat);
 double HSPCalculateAndPrintBitScore(FILE *outputFile, const int score);
 double HSPCalculateAndPrintEValue(FILE *outputFile, const int score);

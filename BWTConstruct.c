@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <emmintrin.h>
+#include <mmintrin.h>
 #include "BWTConstruct.h"
 #include "MiscUtilities.h"
 #include "DNACount.h"
@@ -83,9 +85,12 @@ BWTInc *BWTIncCreate(MMPool *mmPool, const unsigned int textLength, const float 
 
 	bwtInc->targetTextLength = textLength;
 	bwtInc->availableWord = (unsigned int)((textLength + OCC_INTERVAL - 1) / OCC_INTERVAL * OCC_INTERVAL / BITS_IN_WORD * bwtInc->targetNBit);
-	if (bwtInc->availableWord < BWTResidentSizeInWord(textLength) + BWTOccValueMinorSizeInWord(textLength)) {
+	if (bwtInc->availableWord < BWTResidentSizeInWord(textLength) + WORD_BETWEEN_OCC / 2 + BWTOccValueMinorSizeInWord(textLength)) {	// + 8 words so that the 128 bits before and after an explicit occ are in the same aligned 64 byte
 		fprintf(stderr, "BWTIncCreate() : targetNBit is too low!\n");
 		exit(1);
+	}
+	if (bwtInc->availableWord < BWTINC_MIN_MEMORY_IN_WORD) {
+		bwtInc->availableWord = BWTINC_MIN_MEMORY_IN_WORD;
 	}
 	bwtInc->workingMemory = MMUnitAllocate(bwtInc->availableWord * BYTES_IN_WORD);
 
@@ -196,7 +201,7 @@ static void BWTIncConstruct(BWTInc *bwtInc, const unsigned int numChar) {
 		// Set address
 		seq = bwtInc->workingMemory;
 		relativeRank = seq + bwtInc->buildSize + 1;
-		mergedBwt = insertBwt = bwtInc->workingMemory + bwtInc->availableWord - mergedBwtSizeInWord;	// build in place
+		mergedBwt = insertBwt = bwtInc->workingMemory + bwtInc->availableWord - mergedBwtSizeInWord - WORD_BETWEEN_OCC / 2;	// build in place
 
 		BWTIncPutPackedTextToRank(bwtInc->packedText, relativeRank, bwtInc->cumulativeCountInCurrentBuild, numChar);
 
@@ -284,7 +289,7 @@ static void BWTIncConstruct(BWTInc *bwtInc, const unsigned int numChar) {
 		BWTIncBuildBwt(seq, relativeRank, numChar, bwtInc->cumulativeCountInCurrentBuild);
 
 		// Merge BWT
-		mergedBwt = bwtInc->workingMemory + bwtInc->availableWord - mergedBwtSizeInWord 
+		mergedBwt = bwtInc->workingMemory + bwtInc->availableWord - mergedBwtSizeInWord - WORD_BETWEEN_OCC / 2
 				    - bwtInc->numberOfIterationDone * OCC_INTERVAL / BIT_PER_CHAR;
 					// minus numberOfIteration * occInterval to create a buffer for merging
 		BWTIncMergeBwt(sortedRank, bwtInc->bwt->bwtCode, insertBwt, mergedBwt, bwtInc->bwt->textLength, numChar);
@@ -329,7 +334,7 @@ static void BWTIncSetBuildSizeAndTextAddr(BWTInc *bwtInc) {
 	if (bwtInc->bwt->textLength == 0) {
 		// initial build
 		// Minus 2 because n+1 entries of seq and rank needed for n char
-		maxBuildSize = (bwtInc->availableWord - 2 - OCC_INTERVAL / CHAR_PER_WORD)
+		maxBuildSize = (bwtInc->availableWord - 2 * CHAR_PER_WORD - OCC_INTERVAL / CHAR_PER_WORD - WORD_BETWEEN_OCC / 2)
 							/ (2 * CHAR_PER_WORD + 1) * CHAR_PER_WORD;
 		if (bwtInc->initialMaxBuildSize > 0) {
 			bwtInc->buildSize = min(bwtInc->initialMaxBuildSize, maxBuildSize);
@@ -339,8 +344,8 @@ static void BWTIncSetBuildSizeAndTextAddr(BWTInc *bwtInc) {
 	} else {
 		// Minus 3 because n+1 entries of sorted rank, seq and rank needed for n char
 		// Minus numberOfIterationDone because bwt slightly shift to left in each iteration
-		maxBuildSize = (bwtInc->availableWord - bwtInc->bwt->bwtSizeInWord - bwtInc->bwt->occSizeInWord - 3
-							 - bwtInc->numberOfIterationDone * OCC_INTERVAL / BIT_PER_CHAR) 
+		maxBuildSize = (bwtInc->availableWord - bwtInc->bwt->bwtSizeInWord - bwtInc->bwt->occSizeInWord - 3 * CHAR_PER_WORD
+							 - bwtInc->numberOfIterationDone * OCC_INTERVAL / BIT_PER_CHAR - WORD_BETWEEN_OCC / 2) 
 							 / 3;
 		if (maxBuildSize < CHAR_PER_WORD) {
 			fprintf(stderr, "BWTIncSetBuildSizeAndTextAddr(): Not enough space allocated to continue construction!\n");
@@ -363,18 +368,22 @@ static void BWTIncSetBuildSizeAndTextAddr(BWTInc *bwtInc) {
 
 	bwtInc->buildSize = bwtInc->buildSize / CHAR_PER_WORD * CHAR_PER_WORD;
 
-	bwtInc->packedText = bwtInc->workingMemory + 2 * (bwtInc->buildSize + 1);
-	bwtInc->textBuffer = (unsigned char*)(bwtInc->workingMemory + bwtInc->buildSize + 1);
+	bwtInc->packedText = bwtInc->workingMemory + 2 * (bwtInc->buildSize + CHAR_PER_WORD);
+	bwtInc->textBuffer = (unsigned char*)(bwtInc->workingMemory + bwtInc->buildSize + CHAR_PER_WORD);
 
 }
 
 static void BWTIncPutPackedTextToRank(const unsigned int *packedText, unsigned int* __restrict rank, unsigned int* __restrict cumulativeCount, const unsigned int numChar) {
 
 	unsigned int i, j;
-	unsigned int c, t;
 	unsigned int packedMask;
 	unsigned int rankIndex;
 	unsigned int lastWord, numCharInLastWord;
+
+	unsigned char ALIGN_16 temp[CHAR_PER_WORD];
+
+	__m128i p1, p2, mask;
+
 
 	lastWord = (numChar - 1) / CHAR_PER_WORD;
 	numCharInLastWord = numChar - lastWord * CHAR_PER_WORD;
@@ -382,35 +391,44 @@ static void BWTIncPutPackedTextToRank(const unsigned int *packedText, unsigned i
 	packedMask = ALL_ONE_MASK >> (BITS_IN_WORD - BIT_PER_CHAR);
 	rankIndex = numChar - 1;
 
-	t = packedText[lastWord] >> (BITS_IN_WORD - numCharInLastWord * BIT_PER_CHAR);
-	for (i=0; i<numCharInLastWord; i++) {
-		c = t & packedMask;
-#ifdef DEBUG
-		if (c >= ALPHABET_SIZE) {
-			fprintf(stderr, "BWTIncPutPackedTextToRank() : c >= ALPHABET_SIZE!\n");
-			exit(1);
-		}
-#endif
-		cumulativeCount[c+1]++;
-		rank[rankIndex] = c;
+	// Unpack word-packed text; temp[0] will be character in the least significant 2 bits
+	p1 = _mm_cvtsi32_si128(packedText[lastWord]);
+	p2 = _mm_srli_epi32(p1, 4);
+	p1 = _mm_unpacklo_epi8(p1, p2);
+
+	mask = _mm_set1_epi32(0x03030303);
+
+	p2 = _mm_srli_epi32(p1, 2);
+	p1 = _mm_unpacklo_epi8(p1, p2);
+
+	p1 = _mm_and_si128(p1, mask);
+	_mm_store_si128((__m128i*)temp, p1);
+
+	for (i=CHAR_PER_WORD - numCharInLastWord; i<CHAR_PER_WORD; i++) {
+		cumulativeCount[temp[i]+1]++;
+		rank[rankIndex] = temp[i];
 		rankIndex--;
-		t >>= BIT_PER_CHAR;
 	}
 
 	for (i=lastWord; i--;) {	// loop from lastWord - 1 to 0
-		t = packedText[i];
+
+		// Unpack word-packed text; temp[0] will be character in the least significant 2 bits
+		p1 = _mm_cvtsi32_si128(packedText[i]);
+		p2 = _mm_srli_epi32(p1, 4);
+		p1 = _mm_unpacklo_epi8(p1, p2);
+
+		mask = _mm_set1_epi32(0x03030303);
+
+		p2 = _mm_srli_epi32(p1, 2);
+		p1 = _mm_unpacklo_epi8(p1, p2);
+
+		p1 = _mm_and_si128(p1, mask);
+		_mm_store_si128((__m128i*)temp, p1);
+
 		for (j=0; j<CHAR_PER_WORD; j++) {
-			c = t & packedMask;
-#ifdef DEBUG
-			if (c >= ALPHABET_SIZE) {
-				fprintf(stderr, "BWTIncPutPackedTextToRank() : c >= ALPHABET_SIZE!\n");
-				exit(1);
-			}
-#endif
-			cumulativeCount[c+1]++;
-			rank[rankIndex] = c;
+			cumulativeCount[temp[j]+1]++;
+			rank[rankIndex] = temp[j];
 			rankIndex--;
-			t >>= BIT_PER_CHAR;
 		}
 	}
 
@@ -1212,7 +1230,7 @@ void BWTSaveBwtCodeAndOcc(const BWT *bwt, const char *bwtFileName, const char *o
 
 }
 
-void BWTGenerateSaValue(MMPool *mmPool, BWT *bwt, const unsigned int saValueFreq, unsigned int showProgressInterval) {
+void BWTGenerateSaValue(BWT *bwt, const unsigned int saValueFreq, unsigned int showProgressInterval) {
 
 	unsigned int saValue;
 	unsigned int saIndex;
@@ -1226,19 +1244,18 @@ void BWTGenerateSaValue(MMPool *mmPool, BWT *bwt, const unsigned int saValueFreq
 		exit(1);
 	}
 
+	if (saValueFreq == 1) {
+		BWTGenerateFullSaValue(bwt);
+		return;
+	}
 	saValue = bwt->textLength;
 	saIndex = 0;
 
 	numberOfSaValue = (bwt->textLength + saValueFreq) / saValueFreq;
-	if (numberOfSaValue > ALL_ONE_MASK / sizeof(unsigned int)) {
-		fprintf(stderr, "BWTGenerateSaValue() : numberOfSaValue > limit!\n");
-		exit(1);
-	}
-
-	bwt->saValueSize = sizeof(unsigned int) * numberOfSaValue;
+	bwt->saValueSizeInWord = numberOfSaValue;
 	bwt->saInterval = saValueFreq;
 
-	bwt->saValue = MMUnitAllocate(bwt->saValueSize);
+	bwt->saValue = MMUnitAllocate(bwt->saValueSizeInWord * sizeof(unsigned int));
 
 	#ifdef DEBUG
 	initializeVAL(bwt->saValue, numberOfSaValue, ALL_ONE_MASK);
@@ -1289,7 +1306,59 @@ void BWTGenerateSaValue(MMPool *mmPool, BWT *bwt, const unsigned int saValueFreq
 	#endif
 
 	bwt->saValue[0] = (unsigned int)-1;	// Special handling
-	BWTGenerateSaValueOnBoundary(mmPool, bwt);
+
+}
+
+void BWTGenerateFullSaValue(BWT *bwt) {
+
+	unsigned int i, j;
+	unsigned int c, t, n;
+	unsigned int freq[ALPHABET_SIZE];
+
+	if (bwt->saInterval != ALL_ONE_MASK) {
+		fprintf(stderr, "BWTGenerateSaValue() : saValue already exist!\n");
+		exit(1);
+	}
+
+	bwt->saValueSizeInWord = bwt->textLength + 1;
+	bwt->saInterval = 1;
+
+	bwt->saValue = MMUnitAllocate(bwt->saValueSizeInWord * sizeof(unsigned int));
+
+	for (i=0; i<ALPHABET_SIZE; i++) {
+		freq[i] = 0;
+	}
+
+	n = 0;
+	for (i=0; i<bwt->textLength / CHAR_PER_WORD; i++) {
+		t = bwt->bwtCode[i];
+		for (j=0; j<CHAR_PER_WORD; j++) {
+			c = t >> (BITS_IN_WORD - BIT_PER_CHAR);
+			t <<= BIT_PER_CHAR;
+			freq[c]++;
+			bwt->saValue[n + (n>=bwt->inverseSa0)] = freq[c] + bwt->cumulativeFreq[c];
+			n++;
+		}
+	}
+	t = bwt->bwtCode[i];
+	for (j=0; j<bwt->textLength - i * CHAR_PER_WORD; j++) {
+		c = t >> (BITS_IN_WORD - BIT_PER_CHAR);
+		t <<= BIT_PER_CHAR;
+		freq[c]++;
+		bwt->saValue[n + (n>=bwt->inverseSa0)] = freq[c] + bwt->cumulativeFreq[c];
+		n++;
+	}
+
+	t = 0;
+	for (i=bwt->textLength; i>0; i--) {
+		c = t;
+		t = bwt->saValue[c];
+		bwt->saValue[c] = i;
+	}
+
+	bwt->saValue[bwt->inverseSa0] = 0;
+
+	bwt->saValue[0] = (unsigned int)-1;	// Special handling
 
 }
 
@@ -1308,7 +1377,7 @@ void BWTSaveSaValue(const BWT *bwt, const char *saValueFileName) {
 	fwrite(&bwt->saInterval, sizeof(unsigned int), 1, saValueFile);
 
 	fwrite(&bwt->textLength, sizeof(unsigned int), 1, saValueFile);	// Save SA values without special handling on SA[0]
-	fwrite(bwt->saValue + 1, 1, bwt->saValueSize - sizeof(unsigned int), saValueFile);
+	fwrite(bwt->saValue + 1, sizeof(unsigned int), bwt->saValueSizeInWord - 1, saValueFile);
 
 	fclose(saValueFile);
 
@@ -1332,10 +1401,10 @@ void BWTGenerateInverseSa(BWT *bwt, const unsigned int inverseSaFreq, unsigned i
 	saIndex = 0;
 
 	numberOfInverseSa = (bwt->textLength + inverseSaFreq) / inverseSaFreq;
-	bwt->inverseSaSize = sizeof(unsigned int) * numberOfInverseSa;
+	bwt->inverseSaSizeInWord = numberOfInverseSa;
 	bwt->inverseSaInterval = inverseSaFreq;
 
-	bwt->inverseSa = MMUnitAllocate(bwt->inverseSaSize);
+	bwt->inverseSa = MMUnitAllocate(bwt->inverseSaSizeInWord * sizeof(unsigned int));
 
 	#ifdef DEBUG
 	initializeVAL(bwt->inverseSa, numberOfInverseSa, ALL_ONE_MASK);
@@ -1394,92 +1463,145 @@ void BWTSaveInverseSa(const BWT *bwt, const char *inverseSaFileName) {
 	fwrite(&bwt->inverseSa0, sizeof(unsigned int), 1, inverseSaFile);
 	fwrite(bwt->cumulativeFreq + 1, sizeof(unsigned int), ALPHABET_SIZE, inverseSaFile);
 	fwrite(&bwt->inverseSaInterval, sizeof(unsigned int), 1, inverseSaFile);
-	fwrite(bwt->inverseSa, 1, bwt->inverseSaSize, inverseSaFile);
+	fwrite(bwt->inverseSa, sizeof(unsigned int), bwt->inverseSaSizeInWord, inverseSaFile);
 
 	fclose(inverseSaFile);
 
 }
 
-void BWTGenerateSaRangeTable(const BWT *bwt, const unsigned int numOfChar, const char *saRangeFileName) {
+void BWTGenerateCachedSaIndex(const BWT *bwt, const unsigned int numOfChar, const char *cachedSaIndexFileName) {
+
 
 	// stack
-	unsigned int saIndexLeft[MAX_ARPROX_MATCH_LENGTH + 1];
-	unsigned int saIndexRight[MAX_ARPROX_MATCH_LENGTH];
+	unsigned int ALIGN_16 saIndexLeft[MAX_ARPROX_MATCH_LENGTH * ALPHABET_SIZE];
+	unsigned int ALIGN_16 saIndexRight[MAX_ARPROX_MATCH_LENGTH * ALPHABET_SIZE];
 	unsigned char generatedPattern[MAX_ARPROX_MATCH_LENGTH];
 	unsigned int pos;
-	unsigned int i, c;
+	unsigned int i;
 	unsigned int numOfPattern;
-	unsigned int saRangeIndex;
-	unsigned int mask[16] = { 0xFFFFFFFC, 0xFFFFFFF3, 0xFFFFFFCF, 0xFFFFFF3F,
-					 0xFFFFFCFF, 0xFFFFF3FF, 0xFFFFCFFF, 0xFFFF3FFF,
-					 0xFFFCFFFF, 0xFFF3FFFF, 0xFFCFFFFF, 0xFF3FFFFF,
-					 0xFCFFFFFF, 0xF3FFFFFF, 0xCFFFFFFF, 0x3FFFFFFF };
+	unsigned int saRangeIndex, saIndex;
+	unsigned int a;
+	unsigned int mask[16] = { 0x00000000, 0x00000003, 0x0000000F, 0x0000003F,
+							  0x000000FF, 0x000003FF, 0x00000FFF, 0x00003FFF,
+							  0x0000FFFF, 0x0003FFFF, 0x000FFFFF, 0x003FFFFF,
+							  0x00FFFFFF, 0x03FFFFFF, 0x0FFFFFFF, 0x3FFFFFFF };
 
-	SaIndexRange *saIndexRange;
+	unsigned int *cachedSaIndex;
+	__m128i r1, r2, cf, cfp1; 
 
-	FILE * saRangeFile;
+	FILE * cachedSaIndexFile;
 
-	saRangeFile = (FILE*)fopen64(saRangeFileName, "wb");
-	if (saRangeFile == NULL) {
+	cachedSaIndexFile = (FILE*)fopen64(cachedSaIndexFileName, "wb");
+	if (cachedSaIndexFile == NULL) {
 		fprintf(stderr, "BWTGenerateSaRangeTable(): Cannot open SA range file!\n");
 		exit(1);
 	}
 
-	fwrite(&bwt->inverseSa0, sizeof(unsigned int), 1, saRangeFile);
-	fwrite(bwt->cumulativeFreq + 1, sizeof(unsigned int), ALPHABET_SIZE, saRangeFile);
-	fwrite(&numOfChar, sizeof(unsigned int), 1, saRangeFile);
+	fwrite(&bwt->inverseSa0, sizeof(unsigned int), 1, cachedSaIndexFile);
+	fwrite(bwt->cumulativeFreq + 1, sizeof(unsigned int), ALPHABET_SIZE, cachedSaIndexFile);
+	fwrite(&numOfChar, sizeof(unsigned int), 1, cachedSaIndexFile);
 
 	numOfPattern = 1 << (numOfChar * 2);	// 4^numOfChar
-	saIndexRange = MMUnitAllocate(numOfPattern * sizeof(SaIndexRange));
+	cachedSaIndex = MMUnitAllocate((numOfPattern+1) * sizeof(unsigned int));
 	for (i=0; i<numOfPattern; i++) {
-		saIndexRange[i].startSaIndex = 1;
-		saIndexRange[i].endSaIndex = 0;
+		cachedSaIndex[i] = 0;
 	}
+	cachedSaIndex[i] = bwt->textLength;
 
-	// Set this boundary case so that the last character of generated pattern can be located by backward search
-	saIndexLeft[numOfChar] = 0;
-	saIndexRight[numOfChar] = bwt->textLength;
 
 	// Set initial state
+	a = 1;
 	pos = numOfChar - 1;
 	generatedPattern[pos] = (unsigned char)-1;
-	saRangeIndex = 0;
+	saRangeIndex = (unsigned int)-1;
+
+	cf = _mm_load_si128((__m128i*)bwt->cumulativeFreq);	// Load cumulative freq into register
+	r1 = _mm_set1_epi32(1);
+	cfp1 = _mm_add_epi32(cf, r1);
+
+	saIndexLeft[pos * 4 + 0] = 1 + bwt->cumulativeFreq[0];
+	saIndexLeft[pos * 4 + 1] = 1 + bwt->cumulativeFreq[1];
+	saIndexLeft[pos * 4 + 2] = 1 + bwt->cumulativeFreq[2];
+	saIndexLeft[pos * 4 + 3] = 1 + bwt->cumulativeFreq[3];
+	saIndexRight[pos * 4 + 0] = bwt->cumulativeFreq[1];
+	saIndexRight[pos * 4 + 1] = bwt->cumulativeFreq[2];
+	saIndexRight[pos * 4 + 2] = bwt->cumulativeFreq[3];
+	saIndexRight[pos * 4 + 3] = bwt->cumulativeFreq[4];
 
 	while (pos < numOfChar) {
 			
 		generatedPattern[pos]++;
 		if (generatedPattern[pos] >= ALPHABET_SIZE) {
+			saRangeIndex &= mask[numOfChar - 1 - pos];
 			pos++;
+			a >>= 2;
 			continue;
 		}
-		saRangeIndex &= mask[pos];
-		saRangeIndex |= generatedPattern[pos] << (pos * BIT_PER_CHAR);
+		saRangeIndex += a;
 
-		c = generatedPattern[pos];
-		saIndexLeft[pos] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexLeft[pos+1], c) + 1;
-		saIndexRight[pos] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRight[pos+1] + 1, c);
-
-		while (pos > 0 && saIndexLeft[pos] <= saIndexRight[pos]) {
+		while (pos > 0 && saIndexLeft[pos * 4 + generatedPattern[pos]] <= saIndexRight[pos * 4 + generatedPattern[pos]]) {
 			// Set preceding characters to 'a'
 			pos--;
+			a <<= 2;
 			generatedPattern[pos] = 0;
-			saRangeIndex &= mask[pos];
-			c = generatedPattern[pos];
-			saIndexLeft[pos] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexLeft[pos+1], c) + 1;
-			saIndexRight[pos] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRight[pos+1] + 1, c);
+
+			BWTAllOccValueTwoIndex(bwt, saIndexLeft[(pos+1) * 4 + generatedPattern[pos+1]], saIndexRight[(pos+1) * 4 + generatedPattern[pos+1]] + 1,
+										saIndexLeft + pos * 4, saIndexRight + pos * 4);
+			// Add cumulative frequency
+			r1 = _mm_load_si128((__m128i*)(saIndexLeft + pos * 4));
+			r2 = _mm_load_si128((__m128i*)(saIndexRight + pos * 4));
+			r1 = _mm_add_epi32(r1, cfp1);
+			r2 = _mm_add_epi32(r2, cf);
+			_mm_store_si128((__m128i*)(saIndexLeft + pos * 4), r1);
+			_mm_store_si128((__m128i*)(saIndexRight + pos * 4), r2);
 		}
 
-		if (saIndexLeft[pos] <= saIndexRight[pos]) {
-			saIndexRange[saRangeIndex].startSaIndex = saIndexLeft[pos];
-			saIndexRange[saRangeIndex].endSaIndex = saIndexRight[pos];
+		if (saIndexLeft[pos * 4 + generatedPattern[pos]] <= saIndexRight[pos * 4 + generatedPattern[pos]]) {
+			cachedSaIndex[saRangeIndex] = saIndexLeft[pos * 4 + generatedPattern[pos]];
 		}
 	}
 
-	fwrite(saIndexRange, sizeof(SaIndexRange), numOfPattern, saRangeFile);
-	MMUnitFree(saIndexRange, numOfPattern * sizeof(SaIndexRange));
+	for (i=numOfPattern; i>0; i--) {
+		if (cachedSaIndex[i-1] == 0) {
+			cachedSaIndex[i-1] = cachedSaIndex[i];
+		}
+	}
 
+	// Adjust the SA index ranges with consecutive 'a' as suffix so that false positive at end of text is more 'sensible'
+	// False positive is in the form of X$ where |X| < numChar
+	// SA index range is adjusted so that X$ appears as false positive of Xaaa.. where |Xaaa..| = numChar
 
-	fclose(saRangeFile);
+	saRangeIndex = 0;
+	saIndex = 0;
+
+	for (pos=numOfChar-1; pos>0; pos--) {
+
+		saIndex = BWTOccValueOnSpot(bwt, saIndex + 1, &a);
+		saIndex += bwt->cumulativeFreq[a];
+		saRangeIndex >>= BIT_PER_CHAR;
+		saRangeIndex += a << ((numOfChar-1) * BIT_PER_CHAR);
+
+		// Reuse the variables to store saRangeIndex for suffixes shorter than numOfChar
+		saIndexLeft[pos] = saRangeIndex;
+
+	}
+
+	// Sort on saRangeIndex
+	QSort(saIndexLeft + 1, numOfChar - 1, sizeof(unsigned int), QSortUnsignedIntOrder);
+
+	for (pos=numOfChar-1; pos>0; pos--) {
+		i = saIndexLeft[pos];
+		a = cachedSaIndex[i];
+		while (a > 1 && cachedSaIndex[i] == a) {	// No need to adjust for all 'a' suffixes
+			cachedSaIndex[i]--;
+			i--;
+		}
+	}
+
+	fwrite(cachedSaIndex, sizeof(unsigned int), numOfPattern, cachedSaIndexFile);
+	MMUnitFree(cachedSaIndex, (numOfPattern+1) * sizeof(unsigned int));
+
+	fclose(cachedSaIndexFile);
 
 }
 
@@ -1491,7 +1613,7 @@ void BWTGenerateSaBitmap(const BWT *bwt, const unsigned int numOfChar, const cha
 	unsigned char generatedPattern[MAX_ARPROX_MATCH_LENGTH];
 	unsigned int pos;
 	unsigned int i, c;
-	unsigned long long numOfPattern;
+	unsigned LONG numOfPattern;
 	unsigned int numOfPatternExistInText = 0;
 	unsigned int bitmapSize;
 	unsigned int saBitmapIndex;
@@ -1562,7 +1684,7 @@ void BWTGenerateSaBitmap(const BWT *bwt, const unsigned int numOfChar, const cha
 	fwrite(saBitMap, sizeof(unsigned int), bitmapSize, saBitmapFile);
 	MMUnitFree(saBitMap, bitmapSize * sizeof(unsigned int));
 
-	numOfPattern = (unsigned long long)1 << (numOfChar * 2);	// 4^numOfChar
+	numOfPattern = (unsigned LONG)1 << (numOfChar * 2);	// 4^numOfChar
 
 	printf("%u out of %llu length %u patterns exist in text.\n", numOfPatternExistInText, numOfPattern, numOfChar);
 
@@ -1578,19 +1700,19 @@ void BWTGenerateCompressedSaBitmap(const BWT *bwt, const unsigned int numOfChar,
 	unsigned char generatedPattern[MAX_ARPROX_MATCH_LENGTH];
 	unsigned int pos;
 	unsigned int i, j, k, c;
-	unsigned long long numOfPattern;
+	unsigned LONG numOfPattern;
 	unsigned int numOfPatternExistInText = 0;
 	unsigned int bitmapSize;
-	unsigned long long saBitmapIndex;
-	unsigned long long mask[32];
+	unsigned LONG saBitmapIndex;
+	unsigned LONG mask[32];
 
 	unsigned int *saBitMap;
 
 	FILE *saBitmapFile;
 
-	unsigned long long numOfBit = 0, numOfUnaryBit = 0, numOfGammaBit = 0;
-	unsigned long long numOfOneUnaryBit = 0, numOfOneGammaBit = 0;
-	unsigned long long numOfZeroUnaryBit = 0, numOfZeroGammaBit = 0;
+	unsigned LONG numOfBit = 0, numOfUnaryBit = 0, numOfGammaBit = 0;
+	unsigned LONG numOfOneUnaryBit = 0, numOfOneGammaBit = 0;
+	unsigned LONG numOfZeroUnaryBit = 0, numOfZeroGammaBit = 0;
 	unsigned int lastBitValue, bitValue;
 	unsigned int groupSize;
 
@@ -1604,7 +1726,7 @@ void BWTGenerateCompressedSaBitmap(const BWT *bwt, const unsigned int numOfChar,
 
 
 	for (i=0; i<32; i++) {
-		mask[i] = ~((unsigned long long)(0x3) << (i*2));
+		mask[i] = ~((unsigned LONG)(0x3) << (i*2));
 	}
 
 
@@ -1642,7 +1764,7 @@ void BWTGenerateCompressedSaBitmap(const BWT *bwt, const unsigned int numOfChar,
 			continue;
 		}
 		saBitmapIndex &= mask[numOfChar - 1 - pos];
-		saBitmapIndex |= (unsigned long long)generatedPattern[pos] << ((numOfChar - 1 - pos) * BIT_PER_CHAR);
+		saBitmapIndex |= (unsigned LONG)generatedPattern[pos] << ((numOfChar - 1 - pos) * BIT_PER_CHAR);
 
 		c = generatedPattern[pos];
 		saIndexLeft[pos] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexLeft[pos+1], c) + 1;
@@ -1772,7 +1894,7 @@ void BWTGenerateCompressedSaBitmap(const BWT *bwt, const unsigned int numOfChar,
 	fwrite(saBitMap, sizeof(unsigned int), bitmapSize, saBitmapFile);
 	MMUnitFree(saBitMap, bitmapSize * sizeof(unsigned int));
 
-	numOfPattern = (unsigned long long)1 << (numOfChar * 2);	// 4^numOfChar
+	numOfPattern = (unsigned LONG)1 << (numOfChar * 2);	// 4^numOfChar
 
 	printf("%u out of %llu length %u patterns exist in text.\n", numOfPatternExistInText, numOfPattern, numOfChar);
 
@@ -1788,7 +1910,7 @@ void BWTCountPattern(const BWT *bwt, const unsigned int numOfChar) {
 	unsigned char generatedPattern[MAX_ARPROX_MATCH_LENGTH];
 	unsigned int pos;
 	unsigned int c;
-	unsigned long long numOfPattern;
+	unsigned LONG numOfPattern;
 	unsigned int numOfPatternExistInText = 0;
 
 	// Set this boundary case so that the last character of generated pattern can be located by backward search
@@ -1825,7 +1947,7 @@ void BWTCountPattern(const BWT *bwt, const unsigned int numOfChar) {
 		}
 	}
 
-	numOfPattern = (unsigned long long)1 << (numOfChar * 2);	// 4^numOfChar
+	numOfPattern = (unsigned LONG)1 << (numOfChar * 2);	// 4^numOfChar
 
 	printf("%u out of %llu length %u patterns exist in text.\n", numOfPatternExistInText, numOfPattern, numOfChar);
 

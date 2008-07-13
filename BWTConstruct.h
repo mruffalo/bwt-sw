@@ -29,7 +29,7 @@
 #include "BWT.h"
 
 #define BWTINC_INSERT_SORT_NUM_ITEM 7
-
+#define BWTINC_MIN_MEMORY_IN_WORD	1048576	// 4M RAM 
 
 typedef struct BWTInc {
 	BWT *bwt;
@@ -85,11 +85,12 @@ void BWTGenerateOccValueFromBwt(const unsigned int*  bwt, unsigned int* __restri
 
 // Auxliary data structures
 void BWTSaveBwtCodeAndOcc(const BWT *bwt, const char *bwtFileName, const char *occValueFileName);
-void BWTGenerateSaValue(MMPool *mmPool, BWT *bwt, const unsigned int saValueFreq, unsigned int showProgressInterval);
+void BWTGenerateSaValue(BWT *bwt, const unsigned int saValueFreq, unsigned int showProgressInterval);
+void BWTGenerateFullSaValue(BWT *bwt);
 void BWTSaveSaValue(const BWT *bwt, const char *saValueFileName);
 void BWTGenerateInverseSa(BWT *bwt, const unsigned int inverseSaFreq, unsigned int showProgressInterval);
 void BWTSaveInverseSa(const BWT *bwt, const char *inverseSaFileName);
-void BWTGenerateSaRangeTable(const BWT *bwt, const unsigned int numOfChar, const char *saRangeFileName);
+void BWTGenerateCachedSaIndex(const BWT *bwt, const unsigned int numOfChar, const char *cachedSaIndexFileName);
 void BWTGenerateSaBitmap(const BWT *bwt, const unsigned int numOfChar, const char *saBitmapFileName);
 void BWTGenerateCompressedSaBitmap(const BWT *bwt, const unsigned int numOfChar, const char *saBitmapFileName);
 void BWTCountPattern(const BWT *bwt, const unsigned int numOfChar);

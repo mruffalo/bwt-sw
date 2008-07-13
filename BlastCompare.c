@@ -244,25 +244,25 @@ int main(int argc, char** argv) {
 		exit(0);
 	}
 
-	resultFile1 = fopen(ResultFileName1, "r");
+	resultFile1 = fopen64(ResultFileName1, "r");
 	if (resultFile1 == NULL) {
 		fprintf(stderr, "Cannot open ResultFile1!\n");
 		exit(1);
 	}
-	resultFile2 = fopen(ResultFileName2, "r");
+	resultFile2 = fopen64(ResultFileName2, "r");
 	if (resultFile2 == NULL) {
 		fprintf(stderr, "Cannot open resultFile2!\n");
 		exit(1);
 	}
 	if (UnmatchedFileName1[0] != '\0' && UnmatchedFileName1[0] != ' ' && UnmatchedFileName1[0] != '-') {
-		unmatchedFile1 = fopen(UnmatchedFileName1, "w");
+		unmatchedFile1 = fopen64(UnmatchedFileName1, "w");
 		if (unmatchedFile1 == NULL) {
 			fprintf(stderr, "Cannot open UnmatchedFile1!\n");
 			exit(1);
 		}
 	}
 	if (UnmatchedFileName2[0] != '\0' && UnmatchedFileName2[0] != ' ' && UnmatchedFileName2[0] != '-') {
-		unmatchedFile2 = fopen(UnmatchedFileName2, "w");
+		unmatchedFile2 = fopen64(UnmatchedFileName2, "w");
 		if (unmatchedFile2 == NULL) {
 			fprintf(stderr, "Cannot open UnmatchedFile2!\n");
 			exit(1);

@@ -31,6 +31,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <emmintrin.h>
+#include <mmintrin.h>
 #include "BWT.h"
 #include "MiscUtilities.h"
 #include "DNACount.h"
@@ -46,6 +48,9 @@ static INLINE unsigned int BWTOccValueExplicit(const BWT *bwt, const unsigned in
 static INLINE void BWTAllOccValueExplicit(const BWT *bwt, const unsigned int occIndexExplicit, unsigned int* __restrict occValueExplicit);
 static INLINE unsigned int BWTSaIndexToChar(const BWT *bwt, const unsigned int saIndex);
 static INLINE unsigned int BWTGetWordPackedText(const unsigned int *packedText, const unsigned int index, const unsigned int shift, const unsigned int numOfBit);
+
+static INLINE void BWTPrefetchOccValueExplicit(const BWT *bwt, const unsigned int occIndexExplicit);
+static INLINE void BWTPrefetchBWT(const BWT *bwt, const unsigned int index);
 
 
 int SaIndexGroupDPHitOrder1(const void *saIndexGroup, const int index1, const int index2);
@@ -68,7 +73,7 @@ BWT *BWTCreate(MMPool *mmPool, const unsigned int textLength, unsigned int *deco
 	bwt->textLength = 0;
 	bwt->inverseSa = 0;
 
-	bwt->cumulativeFreq = MMPoolDispatch(mmPool, (ALPHABET_SIZE + 1) * sizeof(unsigned int*));
+	bwt->cumulativeFreq = MMPoolDispatch(mmPool, (ALPHABET_SIZE + 1) * sizeof(unsigned int));
 	initializeVAL(bwt->cumulativeFreq, ALPHABET_SIZE + 1, 0);
 
 	bwt->bwtSizeInWord = 0;
@@ -89,11 +94,11 @@ BWT *BWTCreate(MMPool *mmPool, const unsigned int textLength, unsigned int *deco
 	bwt->occValue = NULL;
 
 	bwt->saInterval = ALL_ONE_MASK;
-	bwt->saValueSize = 0;
+	bwt->saValueSizeInWord = 0;
 	bwt->saValue = NULL;
 
 	bwt->inverseSaInterval = ALL_ONE_MASK;
-	bwt->inverseSaSize = 0;
+	bwt->inverseSaSizeInWord = 0;
 	bwt->inverseSa = NULL;
 
 	return bwt;
@@ -101,15 +106,15 @@ BWT *BWTCreate(MMPool *mmPool, const unsigned int textLength, unsigned int *deco
 }
 
 BWT *BWTLoad(MMPool *mmPool, const char *bwtCodeFileName, const char *occValueFileName, 
-			 const char *saValueFileName, const char *inverseSaFileName, const char *saIndexRangeFileName,
+			 const char *saValueFileName, const char *inverseSaFileName, const char *cachedSaIndexFileName,
 			 unsigned int *decodeTable) {
 
 	unsigned int i;
-	FILE *bwtCodeFile, *occValueFile, *saValueFile = NULL, *inverseSaFile = NULL, *saIndexRangeFile = NULL;
+	FILE *bwtCodeFile, *occValueFile, *saValueFile = NULL, *inverseSaFile = NULL, *cachedSaIndexFile = NULL;
 	BWT *bwt;
 	unsigned int tmp;
 	unsigned int bwtCodeLengthInFile;
-	unsigned int numOfSaIndexRange;
+	unsigned int numOfCachedSaIndex;
 
 	bwtCodeFile = (FILE*)fopen64(bwtCodeFileName, "rb");
 	if (bwtCodeFile == NULL) {
@@ -139,10 +144,10 @@ BWT *BWTLoad(MMPool *mmPool, const char *bwtCodeFileName, const char *occValueFi
 		}
 	}
 
-	if (saIndexRangeFileName != NULL && saIndexRangeFileName[0] != '\0' && saIndexRangeFileName[0] != '-') {
-		saIndexRangeFile = (FILE*)fopen64(saIndexRangeFileName, "rb");
-		if (saIndexRangeFile == NULL) {
-			fprintf(stderr, "BWTLoad() : cannot open saIndexRangeFile!\n");
+	if (cachedSaIndexFileName != NULL && cachedSaIndexFileName[0] != '\0' && cachedSaIndexFileName[0] != '-') {
+		cachedSaIndexFile = (FILE*)fopen64(cachedSaIndexFileName, "rb");
+		if (cachedSaIndexFile == NULL) {
+			fprintf(stderr, "BWTLoad() : cannot open cachedSaIndexFile!\n");
 			exit(1);
 		}
 	}
@@ -169,7 +174,7 @@ BWT *BWTLoad(MMPool *mmPool, const char *bwtCodeFileName, const char *occValueFi
 		}
 	}
 
-	bwt->bwtSizeInWord = BWTResidentSizeInWord(bwt->textLength);
+	bwt->bwtSizeInWord = BWTResidentSizeInWord(bwt->textLength) + WORD_BETWEEN_OCC / 2;	// + 8 words so that the 128 bits before and after an explicit occ are in the same aligned 64 byte
 	bwtCodeLengthInFile = BWTFileSizeInWord(bwt->textLength);
 	bwt->bwtCode = MMUnitAllocate(bwt->bwtSizeInWord * sizeof(unsigned int));
 	fread(bwt->bwtCode, sizeof(unsigned int), bwtCodeLengthInFile, bwtCodeFile);
@@ -180,12 +185,12 @@ BWT *BWTLoad(MMPool *mmPool, const char *bwtCodeFileName, const char *occValueFi
 	bwt->occMajorSizeInWord = BWTOccValueMajorSizeInWord(bwt->textLength);
 	bwt->occValue = MMUnitAllocate(bwt->occSizeInWord * sizeof(unsigned int));
 	fread(bwt->occValue, sizeof(unsigned int), bwt->occSizeInWord, occValueFile);
-	bwt->occValueMajor = MMPoolDispatch(mmPool, bwt->occMajorSizeInWord * sizeof(unsigned int));
+	bwt->occValueMajor = MMUnitAllocate(bwt->occMajorSizeInWord * sizeof(unsigned int));
 	fread(bwt->occValueMajor, sizeof(unsigned int), bwt->occMajorSizeInWord, occValueFile);
 	fclose(occValueFile);
 
 	if (decodeTable == NULL) {
-		bwt->decodeTable = MMPoolDispatch(mmPool, DNA_OCC_CNT_TABLE_SIZE_IN_WORD * sizeof(unsigned int));
+		bwt->decodeTable = MMUnitAllocate(DNA_OCC_CNT_TABLE_SIZE_IN_WORD * sizeof(unsigned int));
 		GenerateDNAOccCountTable(bwt->decodeTable);
 		bwt->decodeTableGenerated = TRUE;
 	} else {
@@ -196,7 +201,7 @@ BWT *BWTLoad(MMPool *mmPool, const char *bwtCodeFileName, const char *occValueFi
 	bwt->saValueOnBoundary = NULL;
 	if (saValueFile == NULL) {
 		bwt->saInterval = ALL_ONE_MASK;
-		bwt->saValueSize = 0;
+		bwt->saValueSizeInWord = 0;
 		bwt->saValue = NULL;
 	} else {
 		fread(&tmp, sizeof(unsigned int), 1, saValueFile);
@@ -212,9 +217,9 @@ BWT *BWTLoad(MMPool *mmPool, const char *bwtCodeFileName, const char *occValueFi
 			}
 		}
 		fread(&bwt->saInterval, sizeof(unsigned int), 1, saValueFile);
-		bwt->saValueSize = (bwt->textLength + bwt->saInterval) / bwt->saInterval * sizeof(unsigned int);
-		bwt->saValue = MMUnitAllocate(bwt->saValueSize);
-		fread(bwt->saValue, 1, bwt->saValueSize, saValueFile);
+		bwt->saValueSizeInWord = (bwt->textLength + bwt->saInterval) / bwt->saInterval;
+		bwt->saValue = MMUnitAllocate(bwt->saValueSizeInWord * sizeof(unsigned int));
+		fread(bwt->saValue, sizeof(unsigned int), bwt->saValueSizeInWord, saValueFile);
 		bwt->saValue[0] = (unsigned int)-1;	// Special handling for bwt
 		fclose(saValueFile);
 
@@ -223,7 +228,7 @@ BWT *BWTLoad(MMPool *mmPool, const char *bwtCodeFileName, const char *occValueFi
 
 	if (inverseSaFile == NULL) {
 		bwt->inverseSaInterval = ALL_ONE_MASK;
-		bwt->inverseSaSize = 0;
+		bwt->inverseSaSizeInWord = 0;
 		bwt->inverseSa = NULL;
 	} else {
 		fread(&tmp, sizeof(unsigned int), 1, inverseSaFile);
@@ -239,36 +244,43 @@ BWT *BWTLoad(MMPool *mmPool, const char *bwtCodeFileName, const char *occValueFi
 			}
 		}
 		fread(&bwt->inverseSaInterval, sizeof(unsigned int), 1, inverseSaFile);
-		bwt->inverseSaSize = (bwt->textLength + bwt->inverseSaInterval) / bwt->inverseSaInterval * sizeof(unsigned int);
-		bwt->inverseSa = MMUnitAllocate(bwt->inverseSaSize);
-		fread(bwt->inverseSa, 1, bwt->inverseSaSize, inverseSaFile);
+		bwt->inverseSaSizeInWord = (bwt->textLength + bwt->inverseSaInterval) / bwt->inverseSaInterval;
+		bwt->inverseSa = MMUnitAllocate(bwt->inverseSaSizeInWord * sizeof(unsigned int));
+		fread(bwt->inverseSa, sizeof(unsigned int), bwt->inverseSaSizeInWord, inverseSaFile);
 		fclose(inverseSaFile);
 	}
 
 	// Load Sa index range
-	if (saIndexRangeFile == NULL) {
-		bwt->saIndexRange = NULL;
-		bwt->saIndexRangeNumOfChar = 0;
-		bwt->saIndexRangeSize = 0;
+	if (cachedSaIndexFile == NULL) {
+		// Create a range from cumulative freq
+		bwt->cachedSaIndex = MMUnitAllocate((ALPHABET_SIZE + 1) * sizeof(unsigned int));
+		bwt->cachedSaIndex[0] = bwt->cumulativeFreq[0] + 1;
+		bwt->cachedSaIndex[1] = bwt->cumulativeFreq[1] + 1;
+		bwt->cachedSaIndex[2] = bwt->cumulativeFreq[2] + 1;
+		bwt->cachedSaIndex[3] = bwt->cumulativeFreq[3] + 1;
+		bwt->cachedSaIndex[4] = bwt->textLength + 1;	// To handle boundary case
+		bwt->cachedSaIndexNumOfChar = 1;
+		bwt->cachedSaIndexSizeInWord = (ALPHABET_SIZE + 1);
 	} else {
-		fread(&tmp, sizeof(unsigned int), 1, saIndexRangeFile);
+		fread(&tmp, sizeof(unsigned int), 1, cachedSaIndexFile);
 		if (tmp != bwt->inverseSa0) {
 			fprintf(stderr, "BWTLoad(): SaIndex inverseSa0 not match!\n");
 			exit(1);
 		}
 		for (i=1; i<=ALPHABET_SIZE; i++) {
-			fread(&tmp, sizeof(unsigned int), 1, saIndexRangeFile);
+			fread(&tmp, sizeof(unsigned int), 1, cachedSaIndexFile);
 			if (tmp != bwt->cumulativeFreq[i]) {
 				fprintf(stderr, "BWTLoad(): SaIndex cumulativeFreq not match!\n");
 				exit(1);
 			}
 		}
-		fread(&bwt->saIndexRangeNumOfChar, sizeof(unsigned int), 1, saIndexRangeFile);
-		numOfSaIndexRange = 1 << (bwt->saIndexRangeNumOfChar * 2);	// 4^saIndexRangeNumOfChar
-		bwt->saIndexRange = MMUnitAllocate(numOfSaIndexRange * sizeof(SaIndexRange));
-		fread(bwt->saIndexRange, sizeof(SaIndexRange), numOfSaIndexRange, saIndexRangeFile);
-		bwt->saIndexRangeSize = numOfSaIndexRange * sizeof(SaIndexRange);
-		fclose(saIndexRangeFile);
+		fread(&bwt->cachedSaIndexNumOfChar, sizeof(unsigned int), 1, cachedSaIndexFile);
+		numOfCachedSaIndex = 1 << (bwt->cachedSaIndexNumOfChar * 2);	// 4^cachedSaIndexNumOfChar
+		bwt->cachedSaIndex = MMUnitAllocate((numOfCachedSaIndex + 1) * sizeof(unsigned int));
+		fread(bwt->cachedSaIndex, sizeof(unsigned int), numOfCachedSaIndex, cachedSaIndexFile);
+		bwt->cachedSaIndex[numOfCachedSaIndex] = bwt->textLength + 1;	// To handle boundary case
+		bwt->cachedSaIndexSizeInWord = (numOfCachedSaIndex + 1);
+		fclose(cachedSaIndexFile);
 	}
 
 	return bwt;
@@ -285,22 +297,22 @@ void BWTFree(MMPool *mmPool, BWT *bwt) {
 		MMUnitFree(bwt->occValue, bwt->occSizeInWord * sizeof(unsigned int));
 	}
 	if (bwt->occValueMajor != NULL) {
-		MMPoolReturn(mmPool, bwt->occValueMajor, bwt->occMajorSizeInWord * sizeof(unsigned int));
+		MMUnitFree(bwt->occValueMajor, bwt->occMajorSizeInWord * sizeof(unsigned int));
 	}
 
 	if (bwt->saValue != NULL) {
-		MMUnitFree(bwt->saValue, bwt->saValueSize);
+		MMUnitFree(bwt->saValue, bwt->saValueSizeInWord * sizeof(unsigned int));
 	}
 	if (bwt->inverseSa != NULL) {
-		MMUnitFree(bwt->inverseSa, bwt->inverseSaSize);
+		MMUnitFree(bwt->inverseSa, bwt->inverseSaSizeInWord * sizeof(unsigned int));
 	}
 
 	if (bwt->decodeTableGenerated == TRUE) {
-		MMPoolReturn(mmPool, bwt->decodeTable, DNA_OCC_CNT_TABLE_SIZE_IN_WORD * sizeof(unsigned int));
+		MMUnitFree(bwt->decodeTable, DNA_OCC_CNT_TABLE_SIZE_IN_WORD * sizeof(unsigned int));
 	}
 
-	if (bwt->saIndexRange != NULL) {
-		MMPoolReturn(mmPool, bwt->saIndexRange, bwt->saIndexRangeSize);
+	if (bwt->cachedSaIndex != NULL) {
+		MMUnitFree(bwt->cachedSaIndex, bwt->cachedSaIndexSizeInWord * sizeof(unsigned int));
 	}
 
 	if (bwt->saValueOnBoundary != NULL) {
@@ -317,21 +329,21 @@ void BWTPrintMemoryUsage(const BWT *bwt, FILE *output, const unsigned int packed
 
 	fprintf(output, "BWT code size    : %u\n", bwt->bwtSizeInWord * sizeof(unsigned int));
 	fprintf(output, "Occ value size   : %u\n", (bwt->occSizeInWord + bwt->occMajorSizeInWord) * sizeof(unsigned int));
-	if (bwt->saValueSize > 0) {
-		fprintf(output, "SA value size    : %u\n", bwt->saValueSize);
+	if (bwt->saValueSizeInWord > 0) {
+		fprintf(output, "SA value size    : %u\n", bwt->saValueSizeInWord * sizeof(unsigned int));
 	}
-	if (bwt->inverseSaSize > 0) {
-		fprintf(output, "Inverse SA size  : %u\n", bwt->inverseSaSize);
+	if (bwt->inverseSaSizeInWord > 0) {
+		fprintf(output, "Inverse SA size  : %u\n", bwt->inverseSaSizeInWord * sizeof(unsigned int));
 	}
-	if (bwt->saIndexRange > 0) {
-		fprintf(output, "SA index rangee  : %u\n", bwt->saIndexRangeSize);
+	if (bwt->cachedSaIndex > 0) {
+		fprintf(output, "SA index rangee  : %u\n", bwt->cachedSaIndexSizeInWord * sizeof(unsigned int));
 	}
 	if (packedDNASize > 0) {
 		fprintf(output, "Packed DNA size  : %u\n", packedDNASize);
 	}
 	
-	totalMemorySize = (bwt->bwtSizeInWord + bwt->occSizeInWord + bwt->occMajorSizeInWord) * sizeof(unsigned int)
-					   + bwt->saValueSize + bwt->inverseSaSize + bwt->saIndexRangeSize + packedDNASize;
+	totalMemorySize = (bwt->bwtSizeInWord + bwt->occSizeInWord + bwt->occMajorSizeInWord + bwt->saValueSizeInWord + bwt->inverseSaSizeInWord + bwt->cachedSaIndexSizeInWord) * sizeof(unsigned int)
+					   + packedDNASize;
 	fprintf(output, "Total memory     : %u\n", totalMemorySize);
 	fprintf(output, "Bit per char     : %.2f\n", 
 			(float)totalMemorySize / ((float)bwt->textLength / BITS_IN_BYTE));
@@ -357,16 +369,327 @@ void BWTGenerateSaValueOnBoundary(MMPool *mmPool, BWT *bwt) {
 
 }
 
+// Ordering of index1 and index2 is not important; this module will handle the ordering
+// index1 and index2 can be on the same aligned 128 bit region or can be on adjacant aligned 128 bit region
+// If index1 and index2 are in the same aligned 128 bit region, one of them must be on the boundary
+// These requirements are to reduce the no. of branches in the program flow
+
+unsigned int BWTDecode(const BWT *bwt, const unsigned int index1, const unsigned int index2, const unsigned int character) {
+
+	unsigned int numChar1, numChar2, minIndex, maxIndex, minIndex128, maxIndex128;
+	unsigned int r;
+
+	const static unsigned int ALIGN_16 partitionOne1[4]  = { 47, 31, 15, 0 };
+	const static unsigned int ALIGN_16 partitionOne2[4]  = { 0, 15, 31, 47 };
+	const static unsigned int ALIGN_16 partitionZero1[4]  = { 63, 47, 31, 15 };
+	const static unsigned int ALIGN_16 partitionZero2[4]  = { 15, 31, 47, 63 };
+
+	// SSE registers
+	__m128i r1e, r2e;
+	__m128i mcl;
+	__m128i m0, m1;
+	__m128i r1a, r1b, r1c;
+	__m128i r2a, r2b, r2c;
+
+	// Sort index1 and index2
+	r = (index1 - index2) & -(index1 < index2);
+	minIndex = index2 + r;
+	maxIndex = index1 - r;
+
+	// Locate 128 bit boundary
+	minIndex128 = lastAlignedBoundary(minIndex, CHAR_PER_128);
+	maxIndex128 = lastAlignedBoundary(maxIndex - (maxIndex - minIndex > CHAR_PER_128), CHAR_PER_128);
+
+	// Determine no.of characters to count
+	numChar1 = maxIndex128 - minIndex;
+	numChar2 = maxIndex - maxIndex128;
+
+	// Load encoding into register here in the hope of hiding some memory latency
+	r1e = _mm_load_si128((__m128i *)(bwt->bwtCode + minIndex128 / CHAR_PER_WORD));	// Load encoding into register
+	r2e = _mm_load_si128((__m128i *)(bwt->bwtCode + maxIndex128 / CHAR_PER_WORD));	// Load encoding into register
+
+	// Set character extraction masks 
+	m0 = _mm_set1_epi32(0xFFFFFFFF + (character & 1));	// Character selection mask for even bits
+	m1 = _mm_set1_epi32(0xFFFFFFFF + (character >> 1));	// Character selection mask for odd bits
+	mcl = _mm_set1_epi32(0x55555555);					// Set bit-clearing mask to 0x55555555....(alternate 1-bit)
+
+	// This version of counting where 2 x 128 bits are counted when needed is about 5% slower on P4D
+/*
+	if (numChar1) {
+		// Set counting mask for 2 x 128 bits
+		r1a = _mm_set1_epi32(numChar1);							// Load number of characters into register
+		r1b = _mm_load_si128((__m128i*)partitionOne1);			// Load partition into register
+		r1c = _mm_load_si128((__m128i*)partitionZero1);			// Load partition into register
+		r1b = _mm_cmpgt_epi32(r1a, r1b);						// Compare to generate 4x32 bit mask; the word with counting boundary is all ones
+		r1c = _mm_cmpgt_epi32(r1a, r1c);						// Compare to generate 4x32 bit mask; the word with counting boundary is all zeros
+		r1b = _mm_srli_epi32(r1b, (16 - numChar1 % 16) * 2);	// Shift bits so that all word comform to the requirement of counting the word with counting boundary 
+		r1c = _mm_or_si128(r1b, r1c);							// Combine two masks
+		r1c = _mm_and_si128(r1c, mcl);							// Combine with bit-clearing mask (now = 0x55555555....)
+		// Start counting; encoding has been loaded into register earlier
+		r1b = _mm_srli_epi32(r1e, 1);							// Shift encoding to right by 1 bit
+		r1a = _mm_xor_si128(r1e, m0);							// Check even-bits with mask
+		r1b = _mm_xor_si128(r1b, m1);							// Check odd-bits with mask
+		r1a = _mm_and_si128(r1a, r1b);							// Combine even and odd bits
+		r1a = _mm_and_si128(r1a, r1c);							// Combine with counting mask, which has been combined with bit-clearing mask of 0x55555555.... 
+	} else {
+		r1a = _mm_setzero_si128();								// Set to zero
+	}
+
+	if (numChar2) {
+		// Set counting mask for 2 x 128 bits
+		r2a = _mm_set1_epi32(numChar2);							// Load number of characters into register
+		r2b = _mm_load_si128((__m128i*)partitionOne2);			// Load partition into register
+		r2c = _mm_load_si128((__m128i*)partitionZero2);			// Load partition into register
+		r2b = _mm_cmpgt_epi32(r2a, r2b);						// Compare to generate 4x32 bit mask; the word with counting boundary is all ones
+		r2c = _mm_cmpgt_epi32(r2a, r2c);						// Compare to generate 4x32 bit mask; the word with counting boundary is all zeros
+		r2b = _mm_slli_epi32(r2b, (16 - numChar2 % 16) * 2);	// Shift bits so that all word comform to the requirement of counting the word with counting boundary
+		r2c = _mm_or_si128(r2b, r2c);							// Combine two masks
+		r2c = _mm_and_si128(r2c, mcl);							// Combine with bit-clearing mask (now = 0x55555555....)
+		// Start counting; encoding has been loaded into register earlier
+		r2b = _mm_srli_epi32(r2e, 1);							// Shift encoding to right by 1 bit
+		r2a = _mm_xor_si128(r2e, m0);							// Check even-bits with mask
+		r2b = _mm_xor_si128(r2b, m1);							// Check odd-bits with mask
+		r2a = _mm_and_si128(r2a, r2b);							// Combine even and odd bits
+		r2a = _mm_and_si128(r2a, r2c);							// Combine with counting mask, which has been combined with bit-clearing mask of 0x55555555.... 
+	} else {
+		r2a = _mm_setzero_si128();								// Set to zero
+	}
+*/
+	// This version of counting where 2 x 128 bits are counted no matter is about 5% faster on P4D
+
+	// Set counting mask for 2 x 128 bits
+
+	r1a = _mm_set1_epi32(numChar1);		// Load number of characters into register
+	r2a = _mm_set1_epi32(numChar2);		// Load number of characters into register
+
+	r1b = _mm_load_si128((__m128i*)partitionOne1);	// Load partition into register
+	r2b = _mm_load_si128((__m128i*)partitionOne2);	// Load partition into register
+
+	r1c = _mm_load_si128((__m128i*)partitionZero1);	// Load partition into register
+	r2c = _mm_load_si128((__m128i*)partitionZero2);	// Load partition into register
+
+	r1b = _mm_cmpgt_epi32(r1a, r1b);				// Compare to generate 4x32 bit mask; the word with counting boundary is all ones
+	r2b = _mm_cmpgt_epi32(r2a, r2b);				// Compare to generate 4x32 bit mask; the word with counting boundary is all ones
+				
+	r1c = _mm_cmpgt_epi32(r1a, r1c);				// Compare to generate 4x32 bit mask; the word with counting boundary is all zeros
+	r2c = _mm_cmpgt_epi32(r2a, r2c);				// Compare to generate 4x32 bit mask; the word with counting boundary is all zeros
+
+	r1b = _mm_srli_epi32(r1b, (16 - numChar1 % 16) * 2);	// Shift bits so that all word comform to the requirement of counting the word with counting boundary 
+	r2b = _mm_slli_epi32(r2b, (16 - numChar2 % 16) * 2);	// Shift bits so that all word comform to the requirement of counting the word with counting boundary
+
+	r1c = _mm_or_si128(r1b, r1c);	// Combine two masks
+	r2c = _mm_or_si128(r2b, r2c);	// Combine two masks
+
+	r1c = _mm_and_si128(r1c, mcl);	// Combine with bit-clearing mask (now = 0x55555555....)
+	r2c = _mm_and_si128(r2c, mcl);	// Combine with bit-clearing mask (now = 0x55555555....)
+
+	// Start counting; encoding has been loaded into register earlier
+
+	r1b = _mm_srli_epi32(r1e, 1);	// Shift encoding to right by 1 bit
+	r2b = _mm_srli_epi32(r2e, 1);	// Shift encoding to right by 1 bit
+
+	r1a = _mm_xor_si128(r1e, m0);	// Check even-bits with mask
+	r2a = _mm_xor_si128(r2e, m0);	// Check even-bits with mask
+
+	r1b = _mm_xor_si128(r1b, m1);	// Check odd-bits with mask
+	r2b = _mm_xor_si128(r2b, m1);	// Check odd-bits with mask
+
+	r1a = _mm_and_si128(r1a, r1b);	// Combine even and odd bits
+	r2a = _mm_and_si128(r2a, r2b);	// Combine even and odd bits
+
+	r1a = _mm_and_si128(r1a, r1c);	// Combine with counting mask, which has been combined with bit-clearing mask of 0x55555555.... 
+	r2a = _mm_and_si128(r2a, r2c);	// Combine with counting mask, which has been combined with bit-clearing mask of 0x55555555.... 
+
+
+	// Combine 2 x 128 bits and continue counting
+
+	r1a = _mm_add_epi32(r1a, r2a);		// Combine 2 x 128 bits by adding them together
+
+	mcl = _mm_set1_epi32(0x33333333);	// Set bit-clearing mask to 0x33333333....(alternate 2-bits)
+
+	r1b = _mm_srli_epi32(r1a, 2);		// Shift intermediate result to right by 2 bit
+	r1a = _mm_and_si128(r1a, mcl);		// Clear alternate 2-bits of intermediate result by combining with bit-clearing mask (now = 0x33333333....)
+	r1b = _mm_and_si128(r1b, mcl);		// Clear alternate 2-bits of shifted intermediate result by combining with bit-clearing mask (now = 0x33333333....)
+	r1a = _mm_add_epi32(r1a, r1b);		// Combine shifted and non-shifted intermediate results by adding them together
+
+	mcl = _mm_set1_epi32(0x0F0F0F0F);	// Set bit-clearing mask to 0x0F0F0F0F....(alternate 4-bits)
+	m0 = _mm_setzero_si128();			// Set an all-zero mask
+
+	r1b = _mm_srli_epi32(r1a, 4);		// Shift intermediate result to right by 2 bit
+	r1a = _mm_add_epi32(r1a, r1b);		// Combine shifted and non-shifted intermediate results by adding them together
+	r1a = _mm_and_si128(r1a, mcl);		// Clear alternate 4-bits of intermediate result by combining with bit-clearing mask (now = 0xOFOFOFOF....)
+
+	r1a = _mm_sad_epu8(r1a, m0);		// Treating the 128 bit as 16 x 8 bit; summing up the 1st 8 x 8 bit into 1st 64-bit and 2nd 8 x 8 bit into 2nd 64-bit
+
+	return _mm_extract_epi16(r1a, 0) + _mm_extract_epi16(r1a, 4);	// Extract and return result from register
+
+}
+
+// Ordering of index1 and index2 is not important; this module will handle the ordering
+// index1 and index2 can be on the same aligned 128 bit region or can be on adjacant aligned 128 bit region
+// If index1 and index2 are in the same aligned 128 bit region, one of them must be on the boundary
+// These requirements are to reduce the no. of branches in the program flow
+
+void BWTDecodeAll(const BWT *bwt, const unsigned int index1, const unsigned int index2, unsigned int* __restrict occValue) {
+
+	unsigned int numChar1, numChar2, minIndex, maxIndex, minIndex128, maxIndex128;
+	unsigned int r;
+
+	const static unsigned int ALIGN_16 partitionOne1[4]  = { 47, 31, 15, 0 };
+	const static unsigned int ALIGN_16 partitionOne2[4]  = { 0, 15, 31, 47 };
+	const static unsigned int ALIGN_16 partitionZero1[4]  = { 63, 47, 31, 15 };
+	const static unsigned int ALIGN_16 partitionZero2[4]  = { 15, 31, 47, 63 };
+
+	// SSE registers
+	__m128i r1e, r2e;
+	__m128i mcl;
+	__m128i rc, rg, rt;
+	__m128i ra1, ra2;
+	__m128i rc1, rc2;
+	__m128i rg1, rg2;
+	__m128i rt1, rt2;
+
+
+	// Sort index1 and index2
+	r = (index1 - index2) & -(index1 < index2);
+	minIndex = index2 + r;
+	maxIndex = index1 - r;
+
+	// Locate 128 bit boundary
+	minIndex128 = lastAlignedBoundary(minIndex, CHAR_PER_128);
+	maxIndex128 = lastAlignedBoundary(maxIndex - (maxIndex - minIndex > CHAR_PER_128), CHAR_PER_128);
+
+	// Determine no.of characters to count
+	numChar1 = maxIndex128 - minIndex;
+	numChar2 = maxIndex - maxIndex128;
+
+	// Load encoding into register here in the hope of hiding some memory latency
+	r1e = _mm_load_si128((__m128i *)(bwt->bwtCode + minIndex128 / CHAR_PER_WORD));	// Load encoding into register
+	r2e = _mm_load_si128((__m128i *)(bwt->bwtCode + maxIndex128 / CHAR_PER_WORD));	// Load encoding into register
+
+	// Set character extraction masks 
+	mcl = _mm_set1_epi32(0x55555555);						// Set bit-clearing mask to 0x55555555....(alternate 1-bit)
+
+	// Set counting mask for 2 x 128 bits
+
+	ra1 = _mm_set1_epi32(numChar1);		// Load number of characters into register
+	ra2 = _mm_set1_epi32(numChar2);		// Load number of characters into register
+
+	rc1 = _mm_load_si128((__m128i*)partitionOne1);	// Load partition into register
+	rc2 = _mm_load_si128((__m128i*)partitionOne2);	// Load partition into register
+
+	rg1 = _mm_load_si128((__m128i*)partitionZero1);	// Load partition into register
+	rg2 = _mm_load_si128((__m128i*)partitionZero2);	// Load partition into register
+
+	rc1 = _mm_cmpgt_epi32(ra1, rc1);				// Compare to generate 4x32 bit mask; the word with counting boundary is all ones
+	rc2 = _mm_cmpgt_epi32(ra2, rc2);				// Compare to generate 4x32 bit mask; the word with counting boundary is all ones
+
+	rg1 = _mm_cmpgt_epi32(ra1, rg1);				// Compare to generate 4x32 bit mask; the word with counting boundary is all zeros
+	rg2 = _mm_cmpgt_epi32(ra2, rg2);				// Compare to generate 4x32 bit mask; the word with counting boundary is all zeros
+
+	rc1 = _mm_srli_epi32(rc1, (16 - numChar1 % 16) * 2);	// Shift bits so that all word comform to the requirement of counting the word with counting boundary 
+	rc2 = _mm_slli_epi32(rc2, (16 - numChar2 % 16) * 2);	// Shift bits so that all word comform to the requirement of counting the word with counting boundary
+
+	ra1 = _mm_or_si128(rc1, rg1);	// Combine two masks
+	ra2 = _mm_or_si128(rc2, rg2);	// Combine two masks
+
+	// Start counting; encoding has been loaded into register earlier
+	r1e = _mm_and_si128(r1e, ra1);	// Combine encoding with counting mask
+	r2e = _mm_and_si128(r2e, ra2);	// Combine encoding with counting mask
+
+	// ra1, ra2, rc1, rc2, rg1, rg2, rt1, rt2 all retired
+
+	// Shift and combine with character selection mask
+
+	ra1 = _mm_srli_epi32(r1e, 1);	// Shift encoding to right by 1 bit
+	ra2 = _mm_srli_epi32(r2e, 1);	// Shift encoding to right by 1 bit
+
+	rt1 = _mm_and_si128(r1e, mcl);	// Check even-bits = '1'
+	rt2 = _mm_and_si128(r2e, mcl);	// Check even-bits = '1'
+
+	rg1 = _mm_and_si128(ra1, mcl);	// Check odd-bits = '1'
+	rg2 = _mm_and_si128(ra2, mcl);	// Check odd-bits = '1'
+
+	rc1 = _mm_andnot_si128(r1e, mcl);	// Check even-bits = '0'
+	rc2 = _mm_andnot_si128(r2e, mcl);	// Check even-bits = '0'
+
+	ra1 = _mm_andnot_si128(ra1, mcl);	// Check odd-bits = '0'
+	ra2 = _mm_andnot_si128(ra2, mcl);	// Check odd-bits = '0'
+
+	// r1e, r2e retired
+
+	// Count for 'c' 'g' 't'
+
+	r1e = _mm_and_si128(ra1, rt1);		// Combine even and odd bits
+	r2e = _mm_and_si128(ra2, rt2);		// Combine even and odd bits
+	ra1 = _mm_and_si128(rg1, rc1);		// Combine even and odd bits
+	ra2 = _mm_and_si128(rg2, rc2);		// Combine even and odd bits
+	rc1 = _mm_and_si128(rg1, rt1);		// Combine even and odd bits
+	rc2 = _mm_and_si128(rg2, rt2);		// Combine even and odd bits
+
+	rc = _mm_add_epi32(r1e, r2e);		// Combine 2 x 128 bits by adding them together
+	rg = _mm_add_epi32(ra1, ra2);		// Combine 2 x 128 bits by adding them together
+	rt = _mm_add_epi32(rc1, rc2);		// Combine 2 x 128 bits by adding them together
+
+	// All except rc, rg, rt retired
+
+	// Continue counting rc, rg, rt
+
+	mcl = _mm_set1_epi32(0x33333333);	// Set bit-clearing mask to 0x33333333....(alternate 2-bits)
+
+	rc1 = _mm_srli_epi32(rc, 2);		// Shift intermediate result to right by 2 bit
+	rg1 = _mm_srli_epi32(rg, 2);		// Shift intermediate result to right by 2 bit
+	rt1 = _mm_srli_epi32(rt, 2);		// Shift intermediate result to right by 2 bit
+
+	rc2 = _mm_and_si128(rc, mcl);		// Clear alternate 2-bits of intermediate result by combining with bit-clearing mask (now = 0x33333333....)
+	rg2 = _mm_and_si128(rg, mcl);		// Clear alternate 2-bits of intermediate result by combining with bit-clearing mask (now = 0x33333333....)
+	rt2 = _mm_and_si128(rt, mcl);		// Clear alternate 2-bits of intermediate result by combining with bit-clearing mask (now = 0x33333333....)
+
+	rc1 = _mm_and_si128(rc1, mcl);		// Clear alternate 2-bits of shifted intermediate result by combining with bit-clearing mask (now = 0x33333333....)
+	rg1 = _mm_and_si128(rg1, mcl);		// Clear alternate 2-bits of shifted intermediate result by combining with bit-clearing mask (now = 0x33333333....)
+	rt1 = _mm_and_si128(rt1, mcl);		// Clear alternate 2-bits of shifted intermediate result by combining with bit-clearing mask (now = 0x33333333....)
+
+	rc = _mm_add_epi32(rc1, rc2);		// Combine shifted and non-shifted intermediate results by adding them together
+	rg = _mm_add_epi32(rg1, rg2);		// Combine shifted and non-shifted intermediate results by adding them together
+	rt = _mm_add_epi32(rt1, rt2);		// Combine shifted and non-shifted intermediate results by adding them together
+
+	mcl = _mm_set1_epi32(0x0F0F0F0F);	// Set bit-clearing mask to 0x0F0F0F0F....(alternate 4-bits)
+	r1e = _mm_setzero_si128();			// Set an all-zero mask
+
+	rc1 = _mm_srli_epi32(rc, 4);		// Shift intermediate result to right by 2 bit
+	rg1 = _mm_srli_epi32(rg, 4);		// Shift intermediate result to right by 2 bit
+	rt1 = _mm_srli_epi32(rt, 4);		// Shift intermediate result to right by 2 bit
+
+	rc2 = _mm_add_epi32(rc, rc1);		// Combine shifted and non-shifted intermediate results by adding them together
+	rg2 = _mm_add_epi32(rg, rg1);		// Combine shifted and non-shifted intermediate results by adding them together
+	rt2 = _mm_add_epi32(rt, rt1);		// Combine shifted and non-shifted intermediate results by adding them together
+
+	rc = _mm_and_si128(rc2, mcl);		// Clear alternate 4-bits of intermediate result by combining with bit-clearing mask (now = 0xOFOFOFOF....)
+	rg = _mm_and_si128(rg2, mcl);		// Clear alternate 4-bits of intermediate result by combining with bit-clearing mask (now = 0xOFOFOFOF....)
+	rt = _mm_and_si128(rt2, mcl);		// Clear alternate 4-bits of intermediate result by combining with bit-clearing mask (now = 0xOFOFOFOF....)
+
+	rc = _mm_sad_epu8(rc, r1e);			// Treating the 128 bit as 16 x 8 bit; summing up the 1st 8 x 8 bit into 1st 64-bit and 2nd 8 x 8 bit into 2nd 64-bit
+	rg = _mm_sad_epu8(rg, r1e);			// Treating the 128 bit as 16 x 8 bit; summing up the 1st 8 x 8 bit into 1st 64-bit and 2nd 8 x 8 bit into 2nd 64-bit
+	rt = _mm_sad_epu8(rt, r1e);			// Treating the 128 bit as 16 x 8 bit; summing up the 1st 8 x 8 bit into 1st 64-bit and 2nd 8 x 8 bit into 2nd 64-bit
+
+	occValue[1] = _mm_extract_epi16(rc, 0) + _mm_extract_epi16(rc, 4);	// Extract result from register and store into variable
+	occValue[2] = _mm_extract_epi16(rg, 0) + _mm_extract_epi16(rg, 4);	// Extract result from register and store into variable
+	occValue[3] = _mm_extract_epi16(rt, 0) + _mm_extract_epi16(rt, 4);	// Extract result from register and store into variable
+	occValue[0] = maxIndex - minIndex - occValue[1] - occValue[2] - occValue[3];
+
+}
+
+
 unsigned int BWTOccValue(const BWT *bwt, unsigned int index, const unsigned int character) {
 
-	unsigned int occValue;
+	unsigned int occValue, decodeValue;
 	unsigned int occExplicitIndex, occIndex;
+	unsigned int r;
 
 	// $ is supposed to be positioned at inverseSa0 but it is not encoded
 	// therefore index is subtracted by 1 for adjustment
-	if (index > bwt->inverseSa0) {
-		index--;
-	}
+	index -= (index > bwt->inverseSa0);
+
 #ifdef DEBUG
 	if (index > bwt->textLength) {
 		fprintf(stderr, "BWTOccValue() : index > textLength!\n");
@@ -376,6 +699,8 @@ unsigned int BWTOccValue(const BWT *bwt, unsigned int index, const unsigned int 
 
 	occExplicitIndex = (index + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;	// Bidirectional encoding
 	occIndex = occExplicitIndex * OCC_INTERVAL;
+
+
 	occValue = BWTOccValueExplicit(bwt, occExplicitIndex, character);
 #ifdef DEBUG
 	if (occValue > occIndex) {
@@ -384,33 +709,101 @@ unsigned int BWTOccValue(const BWT *bwt, unsigned int index, const unsigned int 
 	}
 #endif
 
-	if (occIndex == index) {
+	if (occIndex != index) {
+		decodeValue = BWTDecode(bwt, occIndex, index, character);
+		r = -(occIndex > index);
+		return occValue + (decodeValue & ~r) - (decodeValue & r);
+	} else {
 		return occValue;
 	}
 
-	if (occIndex < index) {
-		return occValue + ForwardDNAOccCount(bwt->bwtCode + occIndex / CHAR_PER_WORD, index - occIndex, character, bwt->decodeTable);
-	} else {
-		return occValue - BackwardDNAOccCount(bwt->bwtCode + occIndex / CHAR_PER_WORD, occIndex - index, character, bwt->decodeTable);
-	}
-
 }
-/*
+
 void BWTOccValueTwoIndex(const BWT *bwt, unsigned int index1, unsigned int index2, const unsigned int character, unsigned int* __restrict occValue) {
 
+	unsigned int decodeValue, tempExplicit1, tempExplicit2, tempOccValue1, tempOccValue2;
+	unsigned int occExplicitIndex1, occIndex1;
+	unsigned int occExplicitIndex2, occIndex2;
+	unsigned int r;
+
+	// $ is supposed to be positioned at inverseSa0 but it is not encoded
+	// therefore index is subtracted by 1 for adjustment
+	index1 -= (index1 > bwt->inverseSa0);
+	index2 -= (index2 > bwt->inverseSa0);
+
+#ifdef DEBUG
+	if (index1 > bwt->textLength) {
+		fprintf(stderr, "BWTOccValueTwoIndex() : index1 > textLength!\n");
+		exit(1);
+	}
+	if (index2 > bwt->textLength) {
+		fprintf(stderr, "BWTOccValueTwoIndex() : index2 > textLength!\n");
+		exit(1);
+	}
+#endif
+
+	// Pre-fetch memory to be accessed
+	BWTPrefetchBWT(bwt, index1);
+	BWTPrefetchBWT(bwt, index2);
+
+	occExplicitIndex1 = (index1 + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;	// Bidirectional encoding
+	occIndex1 = occExplicitIndex1 * OCC_INTERVAL;
+	occExplicitIndex2 = (index2 + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;	// Bidirectional encoding
+	occIndex2 = occExplicitIndex2 * OCC_INTERVAL;
+
+	// Pre-fetch memory to be accessed
+	BWTPrefetchOccValueExplicit(bwt, occExplicitIndex1);
+	BWTPrefetchOccValueExplicit(bwt, occExplicitIndex2);
+
+
+	if (occIndex1 != index1) {
+		decodeValue = BWTDecode(bwt, occIndex1, index1, character);
+		r = -(occIndex1 > index1);
+		tempOccValue1 = (decodeValue & ~r) - (decodeValue & r);
+	} else {
+		tempOccValue1 = 0;
+	}
+
+	if (occIndex2 != index2) {
+		decodeValue = BWTDecode(bwt, occIndex2, index2, character);
+		r = -(occIndex2 > index2);
+		tempOccValue2 = (decodeValue & ~r) - (decodeValue & r);
+	} else {
+		tempOccValue2 = 0;
+	}
+
+	tempExplicit1 = BWTOccValueExplicit(bwt, occExplicitIndex1, character);
+	tempExplicit2 = BWTOccValueExplicit(bwt, occExplicitIndex2, character);
+#ifdef DEBUG
+	if (tempExplicit1 > occIndex1) {
+		fprintf(stderr, "BWTOccValueTwoIndex() : occValueExplicit1 > occIndex1!\n");
+		exit(1);
+	}
+	if (tempExplicit2 > occIndex2) {
+		fprintf(stderr, "BWTOccValueTwoIndex() : occValueExplicit2 > occIndex2!\n");
+		exit(1);
+	}
+#endif
+
+	occValue[0] = tempOccValue1 + tempExplicit1;
+	occValue[1] = tempOccValue2 + tempExplicit2;
+
 }
-*/
+
 
 void BWTAllOccValue(const BWT *bwt, unsigned int index, unsigned int* __restrict occValue) {
 
 	unsigned int occExplicitIndex, occIndex;
-	unsigned int tempOccValue[ALPHABET_SIZE];
+	unsigned int ALIGN_16 tempOccValue[ALPHABET_SIZE];
+	unsigned int r;
+
+	// SSE registers
+	__m128i rtov, rov, rc, t1, t2;
 
 	// $ is supposed to be positioned at inverseSa0 but it is not encoded
 	// therefore index is subtracted by 1 for adjustment
-	if (index > bwt->inverseSa0) {
-		index--;
-	}
+	index -= (index > bwt->inverseSa0);
+
 #ifdef DEBUG
 	if (index > bwt->textLength) {
 		fprintf(stderr, "BWTOccValue() : index > textLength!\n");
@@ -423,22 +816,23 @@ void BWTAllOccValue(const BWT *bwt, unsigned int index, unsigned int* __restrict
 
 	BWTAllOccValueExplicit(bwt, occExplicitIndex, occValue);
 
-	if (occIndex == index) {
-		return;
-	}
+	if (occIndex != index) {
 
-	if (occIndex < index) {
-		ForwardDNAAllOccCount(bwt->bwtCode + occIndex / CHAR_PER_WORD, index - occIndex, tempOccValue, bwt->decodeTable);
-		occValue[0] += tempOccValue[0];
-		occValue[1] += tempOccValue[1];
-		occValue[2] += tempOccValue[2];
-		occValue[3] += tempOccValue[3];
+		BWTDecodeAll(bwt, occIndex, index, tempOccValue);
+
+		// The following code add tempOccvalue to occValue if index > occIndex and subtract tempOccValue from occValue if occIndex > index
+		r = -(occIndex > index);
+		rc = _mm_set1_epi32(r);				// Set rc = r r r r
+		rtov = _mm_load_si128((__m128i*)tempOccValue);
+		rov = _mm_load_si128((__m128i*)occValue);
+		t1 = _mm_andnot_si128(rc, rtov);
+		t2 = _mm_and_si128(rc, rtov);
+		rov = _mm_add_epi32(rov, t1);
+		rov = _mm_sub_epi32(rov, t2);
+		_mm_store_si128((__m128i*)occValue, rov);
+
 	} else {
-		BackwardDNAAllOccCount(bwt->bwtCode + occIndex / CHAR_PER_WORD, occIndex - index, tempOccValue, bwt->decodeTable);
-		occValue[0] -= tempOccValue[0];
-		occValue[1] -= tempOccValue[1];
-		occValue[2] -= tempOccValue[2];
-		occValue[3] -= tempOccValue[3];
+		return;
 	}
 
 }
@@ -447,16 +841,17 @@ void BWTAllOccValueTwoIndex(const BWT *bwt, unsigned int index1, unsigned int in
 
 	unsigned int occExplicitIndex1, occIndex1;
 	unsigned int occExplicitIndex2, occIndex2;
-	unsigned int tempOccValue[ALPHABET_SIZE];
+	unsigned int ALIGN_16 tempOccValue1[ALPHABET_SIZE];
+	unsigned int ALIGN_16 tempOccValue2[ALPHABET_SIZE];
+	unsigned int r;
+
+	// SSE registers
+	__m128i rtov, rc, t1, t2, o1, o2;
 
 	// $ is supposed to be positioned at inverseSa0 but it is not encoded
 	// therefore index is subtracted by 1 for adjustment
-	if (index1 > bwt->inverseSa0) {
-		index1--;
-	}
-	if (index2 > bwt->inverseSa0) {
-		index2--;
-	}
+	index1 -= (index1 > bwt->inverseSa0);
+	index2 -= (index2 > bwt->inverseSa0);
 
 #ifdef DEBUG
 	if (index1 > index2) {
@@ -469,52 +864,69 @@ void BWTAllOccValueTwoIndex(const BWT *bwt, unsigned int index1, unsigned int in
 	}
 #endif
 
+	// Pre-fetch memory to be accessed
+	BWTPrefetchBWT(bwt, index1);
+	BWTPrefetchBWT(bwt, index2);
+
 	occExplicitIndex1 = (index1 + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;	// Bidirectional encoding
 	occIndex1 = occExplicitIndex1 * OCC_INTERVAL;
 	occExplicitIndex2 = (index2 + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;	// Bidirectional encoding
 	occIndex2 = occExplicitIndex2 * OCC_INTERVAL;
 
+	// Pre-fetch memory to be accessed
+	BWTPrefetchOccValueExplicit(bwt, occExplicitIndex1);
+	BWTPrefetchOccValueExplicit(bwt, occExplicitIndex2);
+
+	if (occIndex1 != index1) {
+
+		BWTDecodeAll(bwt, occIndex1, index1, tempOccValue1);
+
+		// The following code add tempOccvalue to occValue if index > occIndex and subtract tempOccValue from occValue if occIndex > index
+		r = -(occIndex1 > index1);
+		rtov = _mm_load_si128((__m128i*)tempOccValue1);
+		rc = _mm_set1_epi32(r);				// Set rc = r r r r
+		t1 = _mm_andnot_si128(rc, rtov);
+		t2 = _mm_and_si128(rc, rtov);
+		o1 = _mm_sub_epi32(t1, t2);
+	} else {
+		o1 = _mm_setzero_si128();
+	}
+
+	if (occIndex2 != index2) {
+
+		BWTDecodeAll(bwt, occIndex2, index2, tempOccValue2);
+
+		// The following code add tempOccvalue to occValue if index > occIndex and subtract tempOccValue from occValue if occIndex > index
+		r = -(occIndex2 > index2);
+		rc = _mm_set1_epi32(r);				// Set rc = r r r r
+		rtov = _mm_load_si128((__m128i*)tempOccValue2);
+		t1 = _mm_andnot_si128(rc, rtov);
+		t2 = _mm_and_si128(rc, rtov);
+		o2 = _mm_sub_epi32(t1, t2);
+
+	} else {
+		o2 = _mm_setzero_si128();
+	}
+
 	BWTAllOccValueExplicit(bwt, occExplicitIndex1, occValue1);
 	BWTAllOccValueExplicit(bwt, occExplicitIndex2, occValue2);
 
-	if (occIndex1 != index1) {
-		if (occIndex1 < index1) {
-			ForwardDNAAllOccCount(bwt->bwtCode + occIndex1 / CHAR_PER_WORD, index1 - occIndex1, tempOccValue, bwt->decodeTable);
-			occValue1[0] += tempOccValue[0];
-			occValue1[1] += tempOccValue[1];
-			occValue1[2] += tempOccValue[2];
-			occValue1[3] += tempOccValue[3];
-		} else {
-			BackwardDNAAllOccCount(bwt->bwtCode + occIndex1 / CHAR_PER_WORD, occIndex1 - index1, tempOccValue, bwt->decodeTable);
-			occValue1[0] -= tempOccValue[0];
-			occValue1[1] -= tempOccValue[1];
-			occValue1[2] -= tempOccValue[2];
-			occValue1[3] -= tempOccValue[3];
-		}
-	}
-	if (occIndex2 != index2) {
-		if (occIndex2 < index2) {
-			ForwardDNAAllOccCount(bwt->bwtCode + occIndex2 / CHAR_PER_WORD, index2 - occIndex2, tempOccValue, bwt->decodeTable);
-			occValue2[0] += tempOccValue[0];
-			occValue2[1] += tempOccValue[1];
-			occValue2[2] += tempOccValue[2];
-			occValue2[3] += tempOccValue[3];
-		} else {
-			BackwardDNAAllOccCount(bwt->bwtCode + occIndex2 / CHAR_PER_WORD, occIndex2 - index2, tempOccValue, bwt->decodeTable);
-			occValue2[0] -= tempOccValue[0];
-			occValue2[1] -= tempOccValue[1];
-			occValue2[2] -= tempOccValue[2];
-			occValue2[3] -= tempOccValue[3];
-		}
-	}
+	t1 = _mm_load_si128((__m128i*)occValue1);
+	t2 = _mm_load_si128((__m128i*)occValue2);
 
+	t1 = _mm_add_epi32(t1, o1);
+	t2 = _mm_add_epi32(t2, o2);
+
+	_mm_store_si128((__m128i*)occValue1, t1);
+	_mm_store_si128((__m128i*)occValue2, t2);
 
 }
 
 unsigned int BWTOccValueOnSpot(const BWT *bwt, unsigned int index, unsigned int* __restrict character) {
 
 	unsigned int occExplicitIndex, occIndex;
-	unsigned int occValue = 0;
+	unsigned int occValue, decodeValue;
+	unsigned int r;
 
 	// The bwt character before index will be returned and the count will be up to that bwt character
 	#ifdef DEBUG
@@ -534,9 +946,7 @@ unsigned int BWTOccValueOnSpot(const BWT *bwt, unsigned int index, unsigned int*
 
 	// $ is supposed to be positioned at inverseSa0 but it is not encoded
 	// therefore index is incremented for adjustment
-	if (index > bwt->inverseSa0) {
-		index--;
-	}
+	index -= (index > bwt->inverseSa0);
 
 	// Bidirectional encoding
 	occExplicitIndex = (index + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;
@@ -546,14 +956,12 @@ unsigned int BWTOccValueOnSpot(const BWT *bwt, unsigned int index, unsigned int*
 	occValue = BWTOccValueExplicit(bwt, occExplicitIndex, *character);
 
 	if (occIndex != index) {
-		if (occIndex < index) {
-			return occValue + ForwardDNAOccCount(bwt->bwtCode + occIndex / CHAR_PER_WORD, index - occIndex, *character, bwt->decodeTable);
-		} else {
-			return occValue - BackwardDNAOccCount(bwt->bwtCode + occIndex / CHAR_PER_WORD, occIndex - index, *character, bwt->decodeTable);
-		}
+		decodeValue = BWTDecode(bwt, occIndex, index, *character);
+		r = -(occIndex > index);
+		return occValue + (decodeValue & ~r) - (decodeValue & r);
 	} else {
 		return occValue;
-	}	
+	}
 
 }
 
@@ -611,47 +1019,63 @@ unsigned int BWTSearchOccValue(const BWT *bwt, const unsigned int character, con
 static INLINE unsigned int BWTOccValueExplicit(const BWT *bwt, const unsigned int occIndexExplicit, const unsigned int character) {
 
 	unsigned int occIndexMajor;
+	unsigned int compareMask, shift, mask;
 
 	occIndexMajor = occIndexExplicit * OCC_INTERVAL / OCC_INTERVAL_MAJOR;
 
-	if (occIndexExplicit % OCC_VALUE_PER_WORD == 0) {
-		return bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + character] +
-			   (bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + character] >> 16);
+	compareMask = (-(occIndexExplicit % OCC_VALUE_PER_WORD == 0));
+	shift = 16 & compareMask;
+	mask = 0x0000FFFF | compareMask;
 
-	} else {
-		return bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + character] +
-			   (bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + character] & 0x0000FFFF);
-	}
+	return bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + character] +
+			((bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + character] >> shift) & mask);
 
 }
 
 static INLINE void BWTAllOccValueExplicit(const BWT *bwt, const unsigned int occIndexExplicit, unsigned int* __restrict occValueExplicit) {
 
 	unsigned int occIndexMajor;
+	unsigned int compareMask, shift, mask;
+
+	__m128i v1, v2, m;
 
 	occIndexMajor = occIndexExplicit * OCC_INTERVAL / OCC_INTERVAL_MAJOR;
 
-	if (occIndexExplicit % OCC_VALUE_PER_WORD == 0) {
-		occValueExplicit[0] = bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + 0] +
-			   (bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + 0] >> 16);
-		occValueExplicit[1] = bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + 1] +
-			   (bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + 1] >> 16);
-		occValueExplicit[2] = bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + 2] +
-			   (bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + 2] >> 16);
-		occValueExplicit[3] = bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + 3] +
-			   (bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + 3] >> 16);
-	} else {
-		occValueExplicit[0] = bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + 0] +
-			   (bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + 0] & 0x0000FFFF);
-		occValueExplicit[1] = bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + 1] +
-			   (bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + 1] & 0x0000FFFF);
-		occValueExplicit[2] = bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + 2] +
-			   (bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + 2] & 0x0000FFFF);
-		occValueExplicit[3] = bwt->occValueMajor[occIndexMajor * ALPHABET_SIZE + 3] +
-			   (bwt->occValue[occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE + 3] & 0x0000FFFF);
-	}
+	compareMask = (-(occIndexExplicit % OCC_VALUE_PER_WORD == 0));
+	shift = 16 & compareMask;
+	mask = 0x0000FFFF | compareMask;
+
+	v2 = _mm_load_si128((__m128i *)(bwt->occValue + occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE));
+	v1 = _mm_load_si128((__m128i *)(bwt->occValueMajor + occIndexMajor * ALPHABET_SIZE));
+
+	m = _mm_set1_epi32(mask);
+
+	v2 = _mm_srli_epi32(v2, shift);
+	v2 = _mm_and_si128(v2, m);
+
+	v1 = _mm_add_epi32(v1, v2);
+
+	_mm_store_si128((__m128i*)occValueExplicit, v1);
 
 }
+
+static INLINE void BWTPrefetchOccValueExplicit(const BWT *bwt, const unsigned int occIndexExplicit) {
+
+	unsigned int occIndexMajor;
+
+	occIndexMajor = occIndexExplicit * OCC_INTERVAL / OCC_INTERVAL_MAJOR;
+
+	_mm_prefetch((char*)(bwt->occValue + occIndexExplicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE), _MM_HINT_T0);
+	_mm_prefetch((char*)(bwt->occValueMajor + occIndexMajor * ALPHABET_SIZE), _MM_HINT_T0);
+
+}
+
+static INLINE void BWTPrefetchBWT(const BWT *bwt, const unsigned int index) {
+
+	_mm_prefetch((char*)(bwt->bwtCode + index / CHAR_PER_WORD), _MM_HINT_NTA);
+
+}
+
 
 unsigned int BWTResidentSizeInWord(const unsigned int numChar) {
 
@@ -728,14 +1152,16 @@ unsigned int BWTPsiMinusValue(const BWT *bwt, const unsigned int index) {
 	}
 	#endif
 
-	if (index == bwt->inverseSa0) {
+	if (index != bwt->inverseSa0) {
+
+		occValue = BWTOccValueOnSpot(bwt, index + 1, &c);
+		occValue += bwt->cumulativeFreq[c];
+
+		return occValue;
+
+	} else {
 		return 0;
 	}
-
-	occValue = BWTOccValueOnSpot(bwt, index + 1, &c);
-	occValue += bwt->cumulativeFreq[c];
-
-	return occValue;
 
 }
 
@@ -1335,273 +1761,415 @@ int BWTForwardSearchSaIndex(const unsigned int *packedKey, const unsigned int ke
 
 }
 
-int BWTForwardSearchNoText(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt) {
+int BWTSaBinarySearch(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int *packedText, 
+					  unsigned int *resultSaIndexLeft, unsigned int *resultSaIndexRight, unsigned int *tempKey) {	// tempKey = buffer large enough to hold packed key
 
-	unsigned int startSaIndex, endSaIndex, saIndexMiddle;
+	unsigned int saExplicitIndexLeft, saExplicitIndexRight, saExplicitIndexMiddle;
+	unsigned int saIndexLeft, saIndexRight, saIndexMiddle;
+	unsigned int saValue;
 
-	unsigned int firstChar;
+	unsigned int saRangeIndex;
+	unsigned int index, shift;
 	unsigned int llcp, rlcp, mlcp;
-	unsigned int saIndex;
-	unsigned int i;
-	unsigned int p = 0;	// to avoid compiler warning only
 
-	// Get the SA index initial range by retrieving cumulative frequency
-	firstChar = convertedKey[0];
+	unsigned int pos;
+	unsigned int cachedNumOfChar;
 
-	startSaIndex = bwt->cumulativeFreq[firstChar] + 1;
-	endSaIndex = bwt->cumulativeFreq[firstChar + 1];
+	unsigned int i, j;
 
-	if (startSaIndex > endSaIndex) {
-		// The first character of search pattern does not exists in text
-		return 0;
+	unsigned int numOfWord, numOfFullWord, numOfOddChar;
+	unsigned int text;
+	unsigned int tempKeyATrailing, tempKeyTTrailing;
+
+	unsigned int initialSaIndexLeft, initialSaIndexRight;
+	unsigned int stage1SaExplicitIndexLeft, stage1SaExplicitIndexRight;
+	unsigned int stage1llcp, stage1rlcp;
+	unsigned int stage2StartSaExplicitIndexLeft, stage2Startllcp, stage2Startrlcp;
+	unsigned int stage2EndSaExplicitIndexLeft, stage2Endllcp, stage2Endrlcp;
+	unsigned int stage3SaIndexLeft, stage3SaIndexRight;
+	unsigned int stage3StartSaIndexLeft, stage3StartSaIndexRight, stage3EndSaIndexLeft, stage3EndSaIndexRight;
+
+	// Get SA index range from cached SA index range
+
+	cachedNumOfChar = min(bwt->cachedSaIndexNumOfChar, keyLength);
+
+	saRangeIndex = 0;
+	for (pos = 0; pos < cachedNumOfChar; pos++) {
+		saRangeIndex <<= BIT_PER_CHAR;
+		saRangeIndex |= convertedKey[pos];
 	}
 
-	// Find lcp for left boundary
+	initialSaIndexLeft = bwt->cachedSaIndex[saRangeIndex << ((bwt->cachedSaIndexNumOfChar - cachedNumOfChar) * BIT_PER_CHAR)];
+	initialSaIndexRight = bwt->cachedSaIndex[(saRangeIndex + 1) << ((bwt->cachedSaIndexNumOfChar - cachedNumOfChar) * BIT_PER_CHAR)] - 1;
+
+	if (initialSaIndexLeft > initialSaIndexRight || keyLength == cachedNumOfChar) {
+		*resultSaIndexLeft = initialSaIndexLeft;
+		*resultSaIndexRight = initialSaIndexRight;
+		return (initialSaIndexLeft <= initialSaIndexRight);
+	}
+
+	// Pack key into temp
+	numOfWord = (keyLength - cachedNumOfChar + CHAR_PER_WORD - 1) / CHAR_PER_WORD;
+	numOfFullWord = (keyLength - cachedNumOfChar) / CHAR_PER_WORD;
+	numOfOddChar = keyLength - cachedNumOfChar - numOfFullWord * CHAR_PER_WORD;
+
+	for (i=0; i<numOfFullWord; i++) {
+		tempKey[i] = 0;
+		for (j=0; j<CHAR_PER_WORD; j++) {
+			tempKey[i] <<= BIT_PER_CHAR;
+			tempKey[i] |= convertedKey[pos];
+			pos++;
+		}
+	}
+	if (numOfWord > numOfFullWord) {
+		tempKey[i] = 0;
+		for (j=0; j<numOfOddChar; j++) {
+			tempKey[i] <<= BIT_PER_CHAR;
+			tempKey[i] |= convertedKey[pos];
+			pos++;
+		}
+		tempKey[i] <<= BITS_IN_WORD - numOfOddChar * BIT_PER_CHAR;
+	}
+
+	tempKeyATrailing = tempKey[numOfWord - 1];
+	if (numOfOddChar) {
+		tempKeyTTrailing = tempKeyATrailing | (ALL_ONE_MASK >> (numOfOddChar * BIT_PER_CHAR));
+	} else {
+		tempKeyTTrailing = tempKeyATrailing;
+	}
+
+	// Stage 1: search for an SA index where all full words are matched
+	saExplicitIndexLeft = initialSaIndexLeft / bwt->saInterval;
+	saExplicitIndexRight = (initialSaIndexRight + bwt->saInterval - 1) / bwt->saInterval;
 
 	llcp = 0;
-	saIndex = startSaIndex;
-	while (saIndex != 0 && llcp < keyLength && convertedKey[llcp] == BWTSaIndexToChar(bwt, saIndex)) {
-		llcp++;
-		saIndex = BWTPsiPlusValue(bwt, saIndex);
-	}
-	if (llcp == keyLength) {
-		return 1;
-	}
-
-	// Find lcp for right boundary
-
 	rlcp = 0;
-	saIndex = endSaIndex;
-	while (saIndex != 0 && rlcp < keyLength && convertedKey[rlcp] == BWTSaIndexToChar(bwt, saIndex)) {
-		rlcp++;
-		saIndex = BWTPsiPlusValue(bwt, saIndex);
-	}
-	if (rlcp == keyLength) {
-		return 1;
-	}
+	mlcp = 0;
 
-	// binary search by decoding bwt
+	while (mlcp < numOfFullWord && (saExplicitIndexLeft + 1) < saExplicitIndexRight) {
 
-	while (startSaIndex < endSaIndex) {
+		saExplicitIndexMiddle = average(saExplicitIndexLeft, saExplicitIndexRight);
 
-		saIndexMiddle = average(startSaIndex, endSaIndex);
+		saValue = bwt->saValue[saExplicitIndexMiddle] + cachedNumOfChar;
+		shift = BIT_PER_CHAR * (saValue % CHAR_PER_WORD);
+		index = saValue / CHAR_PER_WORD;
 
 		// Try to increase mlcp
 		mlcp = min(llcp, rlcp);		// mlcp = the characters (in unit of 16 for DNA) matched so far
-		saIndex = saIndexMiddle;
-		for (i=0; i<mlcp; i++) {
-			saIndex = BWTPsiPlusValue(bwt, saIndex);	// The need to do this should make this search approaches worst case performance
-		}
-		while (saIndex != 0 && mlcp < keyLength) {
-			p = BWTSaIndexToChar(bwt, saIndex);
-			if (convertedKey[mlcp] != p) {
-				break;
-			}
-			mlcp++;
-			saIndex = BWTPsiPlusValue(bwt, saIndex);
-		}
-		if (mlcp == keyLength) {
-			return 1;
-		}
-		if (saIndex == 0 || convertedKey[mlcp] > p) {
-			llcp = mlcp;
-			startSaIndex = saIndexMiddle + 1;
-		} else {
-			rlcp = mlcp;
-			endSaIndex = saIndexMiddle;
-		}
-
-	}
-
-	// no match found
-	return 0;
-
-}
-
-int BWTForwardSearchSaIndexNoText(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, 
-								  unsigned int *resultSaIndexLeft, unsigned int *resultSaIndexRight) {
-
-	unsigned int startSaIndex, endSaIndex, saIndexMiddle;
-	unsigned int tempResultSaIndexLeft;
-	unsigned int tempSaIndexLeft, tempSaIndexRight;
-
-	unsigned int firstChar;
-	unsigned int llcp, rlcp, mlcp;
-	unsigned int templlcp, temprlcp;
-	unsigned int saIndex;
-	unsigned int i;
-	unsigned int p = 0;
-
-	// Get the SA index initial range by retrieving cumulative frequency
-	firstChar = convertedKey[0];
-
-	tempSaIndexLeft = startSaIndex = bwt->cumulativeFreq[firstChar] + 1;
-	tempSaIndexRight = endSaIndex = bwt->cumulativeFreq[firstChar + 1];
-	
-
-	if (startSaIndex > endSaIndex) {
-		// The first character of search pattern does not exists in text
-		return 0;
-	}
-
-	// Find lcp for left boundary
-
-	llcp = 0;
-	saIndex = startSaIndex;
-	while (saIndex != 0 && llcp < keyLength && convertedKey[llcp] == BWTSaIndexToChar(bwt, saIndex)) {
-		llcp++;
-		saIndex = BWTPsiPlusValue(bwt, saIndex);
-	}
-	templlcp = llcp;
-
-	// Find lcp for right boundary
-
-	rlcp = 0;
-	saIndex = endSaIndex;
-	while (saIndex != 0 && rlcp < keyLength && convertedKey[rlcp] == BWTSaIndexToChar(bwt, saIndex)) {
-		rlcp++;
-		saIndex = BWTPsiPlusValue(bwt, saIndex);
-	}
-	temprlcp = rlcp;
-
-	if (llcp == keyLength && rlcp == keyLength) {
-		*resultSaIndexLeft = startSaIndex;
-		*resultSaIndexRight = endSaIndex;
-		return 1;
-	}
-
-	while (startSaIndex < endSaIndex) {
-
-		saIndexMiddle = average(startSaIndex, endSaIndex);
-
-		// Try to increase mlcp
-		mlcp = min(llcp, rlcp);
-		saIndex = saIndexMiddle;
-		for (i=0; i<mlcp; i++) {
-			saIndex = BWTPsiPlusValue(bwt, saIndex);	// The need to do this should make this search approaches worst case performance
-		}
-		while (saIndex != 0 && mlcp < keyLength) {
-			p = BWTSaIndexToChar(bwt, saIndex);
-			if (convertedKey[mlcp] != p) {
-				break;
-			}
-			mlcp++;
-			saIndex = BWTPsiPlusValue(bwt, saIndex);
-		}
-
-		if (saIndex == 0 || (mlcp < keyLength && convertedKey[mlcp] > p)) {
-			llcp = mlcp;
-			startSaIndex = saIndexMiddle + 1;
-			tempSaIndexLeft = max(tempSaIndexLeft, startSaIndex);
-			templlcp = llcp;
-		} else {
-			rlcp = mlcp;
-			endSaIndex = saIndexMiddle;
-			if (mlcp == keyLength) {
-				tempSaIndexLeft = max(tempSaIndexLeft, endSaIndex);
-				templlcp = rlcp;
+		
+		do {
+			if (shift != 0) {
+				text = (packedText[index + mlcp] << shift) | (packedText[index + mlcp + 1] >> (BITS_IN_WORD - shift));
 			} else {
-				tempSaIndexRight = endSaIndex;
-				temprlcp = rlcp;
+				text = packedText[index + mlcp];
+			}
+		} while (tempKey[mlcp] == text && ++mlcp < numOfFullWord);
+
+		if (mlcp < numOfFullWord) {
+			if (tempKey[mlcp] > text) {
+				saExplicitIndexLeft = saExplicitIndexMiddle;
+				llcp = mlcp;
+			} else {
+				saExplicitIndexRight = saExplicitIndexMiddle;
+				rlcp = mlcp;
 			}
 		}
 
 	}
 
-	if (max(llcp, rlcp) < keyLength) {
-		// no match found
-		return 0;
-	}
+	stage1SaExplicitIndexLeft = saExplicitIndexLeft;
+	stage1SaExplicitIndexRight = saExplicitIndexRight;
+	stage1llcp = llcp;
+	stage1rlcp = rlcp;
 
-	// The starting SA index found
-	tempResultSaIndexLeft = startSaIndex;
+	// Store stage 1 result: stage1SaExplicitIndexLeft > key; stage1SaExplicitIndexRight < key
+	//						 either (i)  stage1SaExplicitIndexLeft + 1 = stage1SaExplicitIndexRight or
+	//								(ii) all full words are matched somewhere between stage1SaExplicitIndexLeft and stage1SaExplicitIndexRight inclusive
 
-	// search for the ending SA index
+	// Stage 2: locate the starting SA index and ending SA index separately
 
-	// binary search by decoding bwt
+	// Search for starting SA index
 
-	startSaIndex = tempSaIndexLeft;
-	endSaIndex = tempSaIndexRight;
-	llcp = templlcp;
-	rlcp = temprlcp;
+	//saExplicitIndexLeft = stage1SaExplicitIndexLeft;
+	//saExplicitIndexRight = stage1SaExplicitIndexRight;
+	//llcp = stage1llcp;
+	//rlcp = stage1rlcp;
+	//tempKey[numOfWord - 1] = tempKeyATrailing;
 
-	while (startSaIndex < endSaIndex) {
+	mlcp = 0;
+	while ((saExplicitIndexLeft + 1) < saExplicitIndexRight) {
 
-		saIndexMiddle = average(startSaIndex, endSaIndex + 1);
+		saExplicitIndexMiddle = average(saExplicitIndexLeft, saExplicitIndexRight);
+
+		saValue = bwt->saValue[saExplicitIndexMiddle] + cachedNumOfChar;
+		shift = BIT_PER_CHAR * (saValue % CHAR_PER_WORD);
+		index = saValue / CHAR_PER_WORD;
 
 		// Try to increase mlcp
 		mlcp = min(llcp, rlcp);		// mlcp = the characters (in unit of 16 for DNA) matched so far
-		saIndex = saIndexMiddle;
-		for (i=0; i<mlcp; i++) {
-			saIndex = BWTPsiPlusValue(bwt, saIndex);	// The need to do this should make this search approaches worst case performance
-		}
-		while (saIndex != 0 && mlcp < keyLength) {
-			p = BWTSaIndexToChar(bwt, saIndex);
-			if (convertedKey[mlcp] != p) {
-				break;
+		
+		do  {
+			if (shift != 0) {
+				text = (packedText[index + mlcp] << shift) | (packedText[index + mlcp + 1] >> (BITS_IN_WORD - shift));
+			} else {
+				text = packedText[index + mlcp];
 			}
-			mlcp++;
-			saIndex = BWTPsiPlusValue(bwt, saIndex);
-		}
+		} while (tempKey[mlcp] == text && ++mlcp < numOfWord);
 
-		if (saIndex == 0 || mlcp == keyLength || convertedKey[mlcp] > p) {
+		if (mlcp < numOfWord && tempKey[mlcp] > text) {
+			saExplicitIndexLeft = saExplicitIndexMiddle;
 			llcp = mlcp;
-			startSaIndex = saIndexMiddle;
 		} else {
+			saExplicitIndexRight = saExplicitIndexMiddle;
 			rlcp = mlcp;
-			endSaIndex = saIndexMiddle - 1;
+		}
+	}
+
+	stage2StartSaExplicitIndexLeft = saExplicitIndexLeft;
+	stage2Startllcp = llcp;
+	stage2Startrlcp = rlcp;
+
+	// Search for ending SA index
+
+	saExplicitIndexLeft = stage1SaExplicitIndexLeft;
+	saExplicitIndexRight = stage1SaExplicitIndexRight;
+	llcp = stage1llcp;
+	rlcp = stage1rlcp;
+	tempKey[numOfWord - 1] = tempKeyTTrailing;
+
+	mlcp = 0;
+	while ((saExplicitIndexLeft + 1) < saExplicitIndexRight) {
+
+		saExplicitIndexMiddle = average(saExplicitIndexLeft, saExplicitIndexRight);
+
+		saValue = bwt->saValue[saExplicitIndexMiddle] + cachedNumOfChar;
+		shift = BIT_PER_CHAR * (saValue % CHAR_PER_WORD);
+		index = saValue / CHAR_PER_WORD;
+
+		// Try to increase mlcp
+		mlcp = min(llcp, rlcp);		// mlcp = the characters (in unit of 16 for DNA) matched so far
+		
+		do {
+			if (shift != 0) {
+				text = (packedText[index + mlcp] << shift) | (packedText[index + mlcp + 1] >> (BITS_IN_WORD - shift));
+			} else {
+				text = packedText[index + mlcp];
+			}
+		} while (tempKey[mlcp] == text && ++mlcp < numOfWord);
+
+		if (mlcp >= numOfWord || tempKey[mlcp] >= text) {
+			saExplicitIndexLeft = saExplicitIndexMiddle;
+			llcp = mlcp;
+		} else {
+			saExplicitIndexRight = saExplicitIndexMiddle;
+			rlcp = mlcp;
 		}
 
 	}
 
-	*resultSaIndexLeft = tempResultSaIndexLeft;
-	*resultSaIndexRight = endSaIndex;
+	stage2EndSaExplicitIndexLeft = saExplicitIndexLeft;
+	stage2Endllcp = llcp;
+	stage2Endrlcp = rlcp;
 
-	return 1;
+	// Not found
+	if (stage2StartSaExplicitIndexLeft > stage2EndSaExplicitIndexLeft) {
+		return 0;
+	}
+
+	// Stage 3: search while decoding SA using BWT
+	if (stage2StartSaExplicitIndexLeft * bwt->saInterval > initialSaIndexLeft) {
+		stage3StartSaIndexLeft = stage2StartSaExplicitIndexLeft * bwt->saInterval;
+	} else {
+		stage3StartSaIndexLeft = initialSaIndexLeft - 1;
+	}
+	if ((stage2StartSaExplicitIndexLeft + 1) * bwt->saInterval < initialSaIndexRight) {
+		stage3StartSaIndexRight = (stage2StartSaExplicitIndexLeft + 1) * bwt->saInterval;
+	} else {
+		stage3StartSaIndexRight = initialSaIndexRight + 1;
+	}
+	if (stage2EndSaExplicitIndexLeft * bwt->saInterval > initialSaIndexLeft) {
+		stage3EndSaIndexLeft = stage2EndSaExplicitIndexLeft * bwt->saInterval;
+	} else {
+		stage3EndSaIndexLeft = initialSaIndexLeft - 1;
+	}
+	if ((stage2EndSaExplicitIndexLeft + 1) * bwt->saInterval < initialSaIndexRight) {
+		stage3EndSaIndexRight = (stage2EndSaExplicitIndexLeft + 1) * bwt->saInterval;
+	} else {
+		stage3EndSaIndexRight = initialSaIndexRight + 1;
+	}
+
+	// Search for starting SA index
+
+	saIndexLeft = stage3StartSaIndexLeft;
+	saIndexRight = stage3StartSaIndexRight;
+	llcp = stage2Startllcp;
+	rlcp = stage2Startrlcp;
+	tempKey[numOfWord - 1] = tempKeyATrailing;
+
+	mlcp = 0;
+	while ((saIndexLeft + 1) < saIndexRight) {
+
+		saIndexMiddle = average(saIndexLeft, saIndexRight);
+
+		saValue = BWTSaValue(bwt, saIndexMiddle) + cachedNumOfChar;
+		shift = BIT_PER_CHAR * (saValue % CHAR_PER_WORD);
+		index = saValue / CHAR_PER_WORD;
+
+		// Try to increase mlcp
+		mlcp = min(llcp, rlcp);		// mlcp = the characters (in unit of 16 for DNA) matched so far
+		
+		do  {
+			if (shift != 0) {
+				text = (packedText[index + mlcp] << shift) | (packedText[index + mlcp + 1] >> (BITS_IN_WORD - shift));
+			} else {
+				text = packedText[index + mlcp];
+			}
+		} while (tempKey[mlcp] == text && ++mlcp < numOfWord);
+
+		if (mlcp < numOfWord && tempKey[mlcp] > text) {
+			saIndexLeft = saIndexMiddle;
+			llcp = mlcp;
+		} else {
+			saIndexRight = saIndexMiddle;
+			rlcp = mlcp;
+		}
+	}
+
+	stage3SaIndexLeft = saIndexRight;
+	
+	// Search for ending SA index
+
+	saIndexLeft = stage3EndSaIndexLeft;
+	saIndexRight = stage3EndSaIndexRight;
+	llcp = stage2Endllcp;
+	rlcp = stage2Endrlcp;
+	tempKey[numOfWord - 1] = tempKeyTTrailing;
+
+	mlcp = 0;
+	while ((saIndexLeft + 1) < saIndexRight) {
+
+		saIndexMiddle = average(saIndexLeft, saIndexRight);
+
+		saValue = BWTSaValue(bwt, saIndexMiddle) + cachedNumOfChar;
+		shift = BIT_PER_CHAR * (saValue % CHAR_PER_WORD);
+		index = saValue / CHAR_PER_WORD;
+
+		// Try to increase mlcp
+		mlcp = min(llcp, rlcp);		// mlcp = the characters (in unit of 16 for DNA) matched so far
+		
+		do {
+			if (shift != 0) {
+				text = (packedText[index + mlcp] << shift) | (packedText[index + mlcp + 1] >> (BITS_IN_WORD - shift));
+			} else {
+				text = packedText[index + mlcp];
+			}
+		} while (tempKey[mlcp] == text && ++mlcp < numOfWord);
+		if (mlcp >= numOfWord || tempKey[mlcp] >= text) {
+			saIndexLeft = saIndexMiddle;
+			llcp = mlcp;
+		} else {
+			saIndexRight = saIndexMiddle;
+			rlcp = mlcp;
+		}
+	}
+
+	stage3SaIndexRight = saIndexLeft;
+
+	*resultSaIndexLeft = stage3SaIndexLeft;
+	*resultSaIndexRight = stage3SaIndexRight;
+
+	return (stage3SaIndexLeft <= stage3SaIndexRight);
 
 }
 
 int BWTBackwardSearch(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, 
 					  unsigned int *resultSaIndexLeft, unsigned int *resultSaIndexRight) {
 
-	unsigned int startSaIndex, endSaIndex;
 	unsigned int pos;
 	unsigned int c;
+	unsigned int initialSaRangeIndex;
+	unsigned int direction1, direction2;
+	unsigned int index1, index2;
+	unsigned int occExplicitIndex1, occExplicitIndex2;
+	unsigned int occIndex1, occIndex2;
+	unsigned int tempExplicit1, tempExplicit2;
+	unsigned int tempOccValue1, tempOccValue2;
+	unsigned int estimatedIndex1, estimatedIndex2;
+	unsigned int estimatedOccExplicitIndex1, estimatedOccExplicitIndex2;
+	unsigned int decodeValue;
+	unsigned int cachedNumOfChar;
 
-	pos = keyLength - 1;
-	c = convertedKey[pos];
+	cachedNumOfChar = min(bwt->cachedSaIndexNumOfChar, keyLength);
 
-	#ifdef DEBUG
-	if (c >= ALPHABET_SIZE) {
-		fprintf(stderr, "BWTBackwardSearch() : invalid key!\n");
-		exit(1);
+	initialSaRangeIndex = 0;
+	for (pos = keyLength; pos > keyLength - cachedNumOfChar; pos--) {
+		initialSaRangeIndex |= convertedKey[pos-1] << ((keyLength - pos) * BIT_PER_CHAR);
 	}
-	#endif
 
-	startSaIndex = bwt->cumulativeFreq[c] + 1;
-	endSaIndex = bwt->cumulativeFreq[c + 1];
+	index1 = bwt->cachedSaIndex[initialSaRangeIndex << ((bwt->cachedSaIndexNumOfChar - cachedNumOfChar) * BIT_PER_CHAR)];
+	index2 = bwt->cachedSaIndex[(initialSaRangeIndex + 1) << ((bwt->cachedSaIndexNumOfChar - cachedNumOfChar) * BIT_PER_CHAR)];
 
-	if (startSaIndex > endSaIndex) {
-		// The last character of search pattern does not exists in text
-		return 0;
+	for (; pos > 0 && index1 < index2; pos--) {
+
+		c = convertedKey[pos-1];
+		
+		// $ is supposed to be positioned at inverseSa0 but it is not encoded
+		// therefore index is subtracted by 1 for adjustment
+		// Note that this adjustment is not done when BWTOccValue is used
+		index1 -= (index1 > bwt->inverseSa0);
+		index2 -= (index2 > bwt->inverseSa0);
+
+		// Calculate index to explicit occurrence
+		occExplicitIndex1 = (index1 + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;	// Bidirectional encoding
+		occExplicitIndex2 = (index2 + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;	// Bidirectional encoding
+		occIndex1 = occExplicitIndex1 * OCC_INTERVAL;
+		occIndex2 = occExplicitIndex2 * OCC_INTERVAL;
+
+		direction1 = -(occIndex1 > index1);
+		direction2 = -(occIndex2 > index2);
+
+		tempExplicit1 = BWTOccValueExplicit(bwt, occExplicitIndex1, c);
+		tempExplicit2 = BWTOccValueExplicit(bwt, occExplicitIndex2, c);
+
+		// Estimate the SA index before BWT is decoded
+
+		estimatedIndex1 = bwt->cumulativeFreq[c] + tempExplicit1 + (ESTIMATED_OCC_DIFF & ~direction1) - (ESTIMATED_OCC_DIFF & direction1) + 1;
+		estimatedIndex2 = bwt->cumulativeFreq[c] + tempExplicit2 + (ESTIMATED_OCC_DIFF & ~direction2) - (ESTIMATED_OCC_DIFF & direction2) + 1;
+		estimatedOccExplicitIndex1 = (estimatedIndex1 + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;	// Bidirectional encoding
+		estimatedOccExplicitIndex2 = (estimatedIndex2 + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;	// Bidirectional encoding
+
+		// Pre-fetch memory to be accessed
+		BWTPrefetchBWT(bwt, estimatedIndex1);
+		BWTPrefetchBWT(bwt, estimatedIndex2);
+
+		// Pre-fetch memory to be accessed
+		BWTPrefetchOccValueExplicit(bwt, estimatedOccExplicitIndex1);
+		BWTPrefetchOccValueExplicit(bwt, estimatedOccExplicitIndex2);
+
+		// Decode BWT
+		if (occIndex1 != index1) {
+			decodeValue = BWTDecode(bwt, occIndex1, index1, c);
+			tempOccValue1 = (decodeValue & ~direction1) - (decodeValue & direction1);
+		} else {
+			tempOccValue1 = 0;
+		}
+
+		if (occIndex2 != index2) {
+			decodeValue = BWTDecode(bwt, occIndex2, index2, c);
+			tempOccValue2 = (decodeValue & ~direction2) - (decodeValue & direction2);
+		} else {
+			tempOccValue2 = 0;
+		}
+
+		index1 = bwt->cumulativeFreq[c] + tempExplicit1 + tempOccValue1 + 1;
+		index2 = bwt->cumulativeFreq[c] + tempExplicit2 + tempOccValue2 + 1;
+
 	}
 
-	while (pos >= 1 && startSaIndex <= endSaIndex) {
-		c = convertedKey[pos - 1];
-		startSaIndex = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex, c) + 1;
-		endSaIndex = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex + 1, c);
-		pos--;
-	}
-	
-	*resultSaIndexLeft = startSaIndex;
-	*resultSaIndexRight = endSaIndex;
+	*resultSaIndexLeft = index1;
+	*resultSaIndexRight = index2 - 1;
 
-	// Number of occurrence = endSaIndex - startSaIndex + 1
-	if (startSaIndex > endSaIndex) {
-		return 0;
-	} else {
-		return 1;
-	}
+	return (index1 < index2);
 
 }
 
@@ -1680,11 +2248,7 @@ int BWTBackwardSearchCheckWithText(const unsigned char *convertedKey, const unsi
 	*resultSaIndexRight = endSaIndex;
 
 	// Number of occurrence = endSaIndex - startSaIndex + 1
-	if (startSaIndex > endSaIndex) {
-		return 0;
-	} else {
-		return 1;
-	}
+	return (startSaIndex <= endSaIndex);
 
 }
 
@@ -1711,7 +2275,7 @@ unsigned int BWTHammingDistMaxSaIndexGroup(const unsigned int keyLength, const u
 
 }
 
-unsigned int BWTHammingDistCountOcc(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int maxError, const unsigned int matchBitVector) {
+unsigned int BWTHammingDistCountOcc(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int maxError) {
 
 	// stack
 	unsigned int startSaIndex[MAX_ARPROX_MATCH_LENGTH + 1];
@@ -1723,8 +2287,6 @@ unsigned int BWTHammingDistCountOcc(const unsigned char *convertedKey, const uns
 
 	unsigned int c, e;
 	unsigned int errorAdded;
-	unsigned int errorVector;
-
 	unsigned int numOfHit = 0;
 
 	#ifdef DEBUG
@@ -1760,21 +2322,14 @@ unsigned int BWTHammingDistCountOcc(const unsigned char *convertedKey, const uns
 		// Set initial state
 		errorAdded = 1;
 		e = keyLength - 1;
-		errorVector = FIRST_BIT_MASK >> (keyLength - 1);
-		while (e>0 && (errorVector & matchBitVector) != 0) {
+		while (e>0) {
 			c = generatedPattern[e];
  			startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
 			endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
 			e--;
-			errorVector <<= 1;
 		}
-		if ((errorVector & matchBitVector) == 0) {
-			errorPos[1] = e;
-			generatedPattern[e] = (unsigned char)-1;
-		} else {
-			// cannot even place the first error
-			return numOfHit;
-		}
+		errorPos[1] = e;
+		generatedPattern[e] = (unsigned char)-1;
 
 		while (errorAdded > 0) {
 			
@@ -1786,7 +2341,6 @@ unsigned int BWTHammingDistCountOcc(const unsigned char *convertedKey, const uns
 			}
 			if (generatedPattern[e] >= ALPHABET_SIZE) {
 				// Cannot increment the last error; try moving the error to the left
-				errorVector &= ALL_ONE_MASK >> (e + 1);		// clear the error vector from the error position to the left
 				if (e > numOfError - errorAdded) {
 					c = generatedPattern[e] = convertedKey[e];
 					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
@@ -1798,14 +2352,7 @@ unsigned int BWTHammingDistCountOcc(const unsigned char *convertedKey, const uns
 					}
 					errorPos[errorAdded]--;
 					e = errorPos[errorAdded];
-					errorVector |= FIRST_BIT_MASK >> e;		// mark the error position with 1 in error vector
-					if ((errorVector & matchBitVector) == 0) {
-						generatedPattern[e] = (convertedKey[e] == 0);	// 1 if convertedKey = 0, 0 otherwise
-					} else {
-						// error in position for match only
-						generatedPattern[e] = (unsigned char)ALPHABET_SIZE - 1;
-						continue;
-					}
+					generatedPattern[e] = (convertedKey[e] == 0);	// 1 if convertedKey = 0, 0 otherwise
 				} else {
 					// Cannot move error to the left
 					generatedPattern[e] = convertedKey[e];
@@ -1823,17 +2370,7 @@ unsigned int BWTHammingDistCountOcc(const unsigned char *convertedKey, const uns
 				errorAdded++;
 				errorPos[errorAdded] = errorPos[errorAdded-1] - 1;
 				e = errorPos[errorAdded];
-				errorVector |= FIRST_BIT_MASK >> e;		// mark the error position with 1 in error vector
-				if ((errorVector & matchBitVector) == 0) {
-                    c = generatedPattern[e] = (convertedKey[e] == 0);	// 1 if convertedKey = 0, 0 otherwise
-				} else {
-					// error in position for match only
-					generatedPattern[e] = (unsigned char)ALPHABET_SIZE - 1;
-					// so that it skip the remaining of the while loop
-					startSaIndex[e] = 1;		
-					endSaIndex[e] = 0;
-					break;
-				}
+				c = generatedPattern[e] = (convertedKey[e] == 0);	// 1 if convertedKey = 0, 0 otherwise
 				startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
 				endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
 			}
@@ -1858,7 +2395,7 @@ unsigned int BWTHammingDistCountOcc(const unsigned char *convertedKey, const uns
 }
 /*
 unsigned int BWTHammingDistMatch(const BWT *bwt, const unsigned char *convertedKey, const HitCombination *hitCombination,
-						const SaIndexRange *saIndexRange, const unsigned int saIndexRangeNumOfChar,
+						const SaIndexRange *cachedSaIndex, const unsigned int cachedSaIndexNumOfChar,
 						SaIndexGroupNew* __restrict saIndexGroup, const unsigned int maxSaIndexGroup) {
 
 	// stack
@@ -1901,11 +2438,11 @@ unsigned int BWTHammingDistMatch(const BWT *bwt, const unsigned char *convertedK
 
 	// Setup for looking up SA index range
 	initialSaRangeIndex = 0;
-	if (saIndexRangeNumOfChar <= hitCombination->keyLength) {
-		for (i=0; i<saIndexRangeNumOfChar; i++) {
-			initialSaRangeIndex |= convertedKey[hitCombination->keyLength - 1 - i] << ((saIndexRangeNumOfChar - 1 - i) * BIT_PER_CHAR);
+	if (cachedSaIndexNumOfChar <= hitCombination->keyLength) {
+		for (i=0; i<cachedSaIndexNumOfChar; i++) {
+			initialSaRangeIndex |= convertedKey[hitCombination->keyLength - 1 - i] << ((cachedSaIndexNumOfChar - 1 - i) * BIT_PER_CHAR);
 		}
-		minE = hitCombination->keyLength - 1 - saIndexRangeNumOfChar;
+		minE = hitCombination->keyLength - 1 - cachedSaIndexNumOfChar;
 	} else {
 		minE = hitCombination->keyLength;
 	}
@@ -1950,8 +2487,8 @@ unsigned int BWTHammingDistMatch(const BWT *bwt, const unsigned char *convertedK
 					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
 					endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
 				} else {
-					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-					endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].endSaIndex + 1, c);
+					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].startSaIndex, c) + 1;
+					endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].endSaIndex + 1, c);
 				}
 			}
 
@@ -1988,8 +2525,8 @@ unsigned int BWTHammingDistMatch(const BWT *bwt, const unsigned char *convertedK
 							startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
 							endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
 						} else {
-							startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-							endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].endSaIndex + 1, c);
+							startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].startSaIndex, c) + 1;
+							endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].endSaIndex + 1, c);
 						}
 						if (startSaIndex[e] >= endSaIndex[e]) {
 							// Pattern suffix not exists in text
@@ -2026,8 +2563,8 @@ unsigned int BWTHammingDistMatch(const BWT *bwt, const unsigned char *convertedK
 					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
 					endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
 				} else {
-					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-					endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].endSaIndex + 1, c);
+					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].startSaIndex, c) + 1;
+					endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].endSaIndex + 1, c);
 				}
 			}
 
@@ -2056,8 +2593,8 @@ unsigned int BWTHammingDistMatch(const BWT *bwt, const unsigned char *convertedK
 						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
 						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
 					} else {
-						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].endSaIndex + 1, c);
+						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].startSaIndex, c) + 1;
+						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].endSaIndex + 1, c);
 					}
 				}
 
@@ -2076,8 +2613,8 @@ unsigned int BWTHammingDistMatch(const BWT *bwt, const unsigned char *convertedK
 						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
 						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
 					} else {
-						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].endSaIndex + 1, c);
+						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].startSaIndex, c) + 1;
+						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].endSaIndex + 1, c);
 					}
 				}
 
@@ -2106,8 +2643,55 @@ unsigned int BWTHammingDistMatch(const BWT *bwt, const unsigned char *convertedK
 }
 */
 
-int BWTHammingDistMatchOld(const unsigned char *convertedKey, const int keyLength, const BWT *bwt, const int maxError,
-						   SaIndexGroupNew* __restrict saIndexGroup, const int maxSaIndexGroup, 
+// This is breath-first hamming distance search
+// It does not check whether there is enough memory to hold all the saIndexGroup
+// Caller needs to invoke BWTHammingDistMaxSaIndexGroup() to determine the maximum no. of saIndexGroup
+// maxError must be at least 1
+/*
+int BWTHammingDistMatchBF(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int maxError,
+						  SaIndexGroupNew* __restrict saIndexGroup, const unsigned int posQuery, const unsigned int info) {
+
+	unsigned int cachedSaNumOfChar;
+	unsigned int temp;
+	unsigned int pos;
+
+	#ifdef DEBUG
+	if (maxError < 1) {
+		fprintf(stderr, "BWTHammingDistMatchBF() : maxError must be at least 1!\n");
+		exit(1);
+	}
+	if (maxError > keyLength) {
+		fprintf(stderr, "BWTHammingDistMatch() : maxError > keyLength!\n");
+		exit(1);
+	}
+	#endif
+
+	// Setup for looking up cached SA index range
+	if (bwt->cachedSaIndexNumOfChar <= keyLength) {
+		cachedSaNumOfChar = bwt->cachedSaIndexNumOfChar;
+	} else {
+		cachedSaNumOfChar = 1;
+	}
+
+	((SaIndexGroupTemp*)saIndexGroup + 0)->startSaIndex1 = 0;
+	((SaIndexGroupTemp*)saIndexGroup + 1)->startSaIndex1 = 1;
+	((SaIndexGroupTemp*)saIndexGroup + 2)->startSaIndex1 = 2;
+	((SaIndexGroupTemp*)saIndexGroup + 3)->startSaIndex1 = 3;
+
+	// Swap exact match to the last entry
+	temp = ((SaIndexGroupTemp*)saIndexGroup + convertedKey[keyLength-1])->startSaIndex1;
+	((SaIndexGroupTemp*)saIndexGroup + 0)->startSaIndex1 = ((SaIndexGroupTemp*)saIndexGroup + convertedKey[keyLength-1])->startSaIndex1;
+	((SaIndexGroupTemp*)saIndexGroup + convertedKey[keyLength-1])->startSaIndex1 = temp;
+
+	pos = 1;
+
+
+
+}
+*/
+
+int BWTHammingDistMatchOld(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int maxError,
+						   SaIndexGroupNew* __restrict saIndexGroup, const unsigned int maxSaIndexGroup, 
 						   const unsigned int posQuery, const unsigned int info) {
 
 	// stack
@@ -2116,19 +2700,19 @@ int BWTHammingDistMatchOld(const unsigned char *convertedKey, const int keyLengt
 	unsigned char generatedPattern[MAX_ARPROX_MATCH_LENGTH];
 	unsigned int errorPos[MAX_APPROX_MATCH_ERROR + 1];
 
-	int numOfSaGroup;
-	int numOfError;
+	unsigned int numOfSaGroup;
+	unsigned int numOfError;
 
-	int i;
+	unsigned int i;
 	unsigned c;
-	int e;
-	int errorAdded;
+	unsigned int e;
+	unsigned int errorAdded;
 
-	unsigned int tempSaIndexLeft, tempSaIndexRight;
+	unsigned int tempSaIndex[2];
 
 	unsigned int saRangeIndex;
 	unsigned int initialSaRangeIndex;
-	int minE;
+	unsigned int minE;
 	unsigned int mask[16] = { 0xFFFFFFFC, 0xFFFFFFF3, 0xFFFFFFCF, 0xFFFFFF3F,
 					 0xFFFFFCFF, 0xFFFFF3FF, 0xFFFFCFFF, 0xFFFF3FFF,
 					 0xFFFCFFFF, 0xFFF3FFFF, 0xFFCFFFFF, 0xFF3FFFFF,
@@ -2151,11 +2735,11 @@ int BWTHammingDistMatchOld(const unsigned char *convertedKey, const int keyLengt
 
 	// Setup for looking up SA index range
 	initialSaRangeIndex = 0;
-	if (bwt->saIndexRangeNumOfChar <= keyLength && bwt->saIndexRangeNumOfChar != 0) {
-		for (i=0; i<bwt->saIndexRangeNumOfChar; i++) {
-			initialSaRangeIndex |= convertedKey[keyLength - 1 - i] << ((bwt->saIndexRangeNumOfChar - 1 - i) * BIT_PER_CHAR);
+	if (bwt->cachedSaIndexNumOfChar <= keyLength && bwt->cachedSaIndexNumOfChar != 0) {
+		for (i = keyLength; i > keyLength - bwt->cachedSaIndexNumOfChar; i--) {
+			initialSaRangeIndex |= convertedKey[i-1] << (2 * (keyLength - i));
 		}
-		minE = keyLength - 1 - bwt->saIndexRangeNumOfChar;
+		minE = keyLength - 1 - bwt->cachedSaIndexNumOfChar;
 	} else {
 		minE = keyLength;
 	}
@@ -2166,11 +2750,11 @@ int BWTHammingDistMatchOld(const unsigned char *convertedKey, const int keyLengt
 	endSaIndex[keyLength] = bwt->textLength;
 
 	// Exact match
-	numOfSaGroup = BWTBackwardSearch(convertedKey, keyLength, bwt, &tempSaIndexLeft, &tempSaIndexRight);
+	numOfSaGroup = BWTBackwardSearch(convertedKey, keyLength, bwt, tempSaIndex, tempSaIndex + 1);
 	if (numOfSaGroup > 0) {
 		if (numOfSaGroup <= maxSaIndexGroup) {
-			saIndexGroup[0].startSaIndex = tempSaIndexLeft;
-			saIndexGroup[0].numOfMatch = tempSaIndexRight - tempSaIndexLeft + 1;
+			saIndexGroup[0].startSaIndex = tempSaIndex[0];
+			saIndexGroup[0].numOfMatch = tempSaIndex[1] - tempSaIndex[0] + 1;
 			saIndexGroup[0].posQuery = posQuery;
 			saIndexGroup[0].info = info;
 		} else {
@@ -2204,16 +2788,16 @@ int BWTHammingDistMatchOld(const unsigned char *convertedKey, const int keyLengt
 					c = generatedPattern[e] = convertedKey[e];
 
 					if (e > minE) {
-						saRangeIndex &= mask[e - minE - 1];
-						saRangeIndex |= c << ((e - minE - 1) * BIT_PER_CHAR);
+						saRangeIndex &= mask[keyLength - 1 - e];
+						saRangeIndex |= c << ((keyLength - 1 - e) * BIT_PER_CHAR);
 					} else {
 						if (e < minE) {
-							startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
-							endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
+							BWTOccValueTwoIndex(bwt, startSaIndex[e+1], endSaIndex[e+1] + 1, c, tempSaIndex);
 						} else {
-							startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, bwt->saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-							endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, bwt->saIndexRange[saRangeIndex].endSaIndex + 1, c);
+							BWTOccValueTwoIndex(bwt, bwt->cachedSaIndex[saRangeIndex], bwt->cachedSaIndex[saRangeIndex + 1], c, tempSaIndex);
 						}
+						startSaIndex[e] = bwt->cumulativeFreq[c] + tempSaIndex[0] + 1;
+						endSaIndex[e] = bwt->cumulativeFreq[c] + tempSaIndex[1];
 						if (startSaIndex[e] >= endSaIndex[e]) {
 							// Pattern suffix not exists in text
 							errorAdded--;
@@ -2235,16 +2819,16 @@ int BWTHammingDistMatchOld(const unsigned char *convertedKey, const int keyLengt
 			c = generatedPattern[e];
 
 			if (e > minE) {
-				saRangeIndex &= mask[e - minE - 1];
-				saRangeIndex |= c << ((e - minE - 1) * BIT_PER_CHAR);
+				saRangeIndex &= mask[keyLength - 1 - e];
+				saRangeIndex |= c << ((keyLength - 1 - e) * BIT_PER_CHAR);
 			} else {
 				if (e < minE) {
-					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
-					endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
+					BWTOccValueTwoIndex(bwt, startSaIndex[e+1], endSaIndex[e+1] + 1, c, tempSaIndex);
 				} else {
-					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, bwt->saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-					endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, bwt->saIndexRange[saRangeIndex].endSaIndex + 1, c);
+					BWTOccValueTwoIndex(bwt, bwt->cachedSaIndex[saRangeIndex], bwt->cachedSaIndex[saRangeIndex + 1], c, tempSaIndex);
 				}
+				startSaIndex[e] = bwt->cumulativeFreq[c] + tempSaIndex[0] + 1;
+				endSaIndex[e] = bwt->cumulativeFreq[c] + tempSaIndex[1];
 			}
 
 			while (errorAdded < numOfError && e > 0 && (e > minE || startSaIndex[e] <= endSaIndex[e])) {
@@ -2255,16 +2839,16 @@ int BWTHammingDistMatchOld(const unsigned char *convertedKey, const int keyLengt
                 c = generatedPattern[e] = (convertedKey[e] == 0);	// 1 if convertedKey = 0, 0 otherwise
 
 				if (e > minE) {
-					saRangeIndex &= mask[e - minE - 1];
-					saRangeIndex |= c << ((e - minE - 1) * BIT_PER_CHAR);
+					saRangeIndex &= mask[keyLength - 1 - e];
+					saRangeIndex |= c << ((keyLength - 1 - e) * BIT_PER_CHAR);
 				} else {
 					if (e < minE) {
-						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
-						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
+						BWTOccValueTwoIndex(bwt, startSaIndex[e+1], endSaIndex[e+1] + 1, c, tempSaIndex);
 					} else {
-						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, bwt->saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, bwt->saIndexRange[saRangeIndex].endSaIndex + 1, c);
+						BWTOccValueTwoIndex(bwt, bwt->cachedSaIndex[saRangeIndex], bwt->cachedSaIndex[saRangeIndex + 1], c, tempSaIndex);
 					}
+					startSaIndex[e] = bwt->cumulativeFreq[c] + tempSaIndex[0] + 1;
+					endSaIndex[e] = bwt->cumulativeFreq[c] + tempSaIndex[1];
 				}
 
 			}
@@ -2275,16 +2859,16 @@ int BWTHammingDistMatchOld(const unsigned char *convertedKey, const int keyLengt
 				c = generatedPattern[e];
 
 				if (e > minE) {
-					saRangeIndex &= mask[e - minE - 1];
-					saRangeIndex |= c << ((e - minE - 1) * BIT_PER_CHAR);
+					saRangeIndex &= mask[keyLength - 1 - e];
+					saRangeIndex |= c << ((keyLength - 1 - e) * BIT_PER_CHAR);
 				} else {
 					if (e < minE) {
-						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
-						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
+						BWTOccValueTwoIndex(bwt, startSaIndex[e+1], endSaIndex[e+1] + 1, c, tempSaIndex);
 					} else {
-						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, bwt->saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, bwt->saIndexRange[saRangeIndex].endSaIndex + 1, c);
+						BWTOccValueTwoIndex(bwt, bwt->cachedSaIndex[saRangeIndex], bwt->cachedSaIndex[saRangeIndex + 1], c, tempSaIndex);
 					}
+					startSaIndex[e] = bwt->cumulativeFreq[c] + tempSaIndex[0] + 1;
+					endSaIndex[e] = bwt->cumulativeFreq[c] + tempSaIndex[1];
 				}
 
 			}
@@ -2309,7 +2893,7 @@ int BWTHammingDistMatchOld(const unsigned char *convertedKey, const int keyLengt
 }
 
 unsigned int BWTSubPatternHammingDistCountOcc(const unsigned char *convertedKey, const unsigned int keyLength, const unsigned int subPatternLength, const BWT *bwt, 
-									 const unsigned int maxError, const unsigned int skip, const unsigned int matchBitVector) {
+									 const unsigned int maxError, const unsigned int skip) {
 
 	unsigned int i;
 	unsigned int numOfSubPattern, advance;
@@ -2340,7 +2924,7 @@ unsigned int BWTSubPatternHammingDistCountOcc(const unsigned char *convertedKey,
 
 		if (keyLength - i * advance - subPatternLength >= nextFilteredChar) {
 			numOfHit += BWTHammingDistCountOcc(convertedKey + keyLength - i*advance - subPatternLength, subPatternLength,
-												  bwt, maxError, matchBitVector);
+												  bwt, maxError);
 		}
 
 	}
@@ -2352,7 +2936,7 @@ unsigned int BWTSubPatternHammingDistCountOcc(const unsigned char *convertedKey,
 /*
 int BWTSubPatternHammingDistSaIndex(const BWT *bwt, const unsigned char *convertedKey, const int keyLength, const int skip, 
 									const HitCombination *hitCombination, 
-									const SaIndexRange *saIndexRange, const unsigned int saIndexRangeNumOfChar,
+									const SaIndexRange *cachedSaIndex, const unsigned int cachedSaIndexNumOfChar,
 									SaIndexGroupNew* __restrict saIndexGroup, const int maxnumOfSaIndexGroup,
 									int* __restrict firstSaIndexGroupForSubPattern) {
 
@@ -2382,7 +2966,7 @@ int BWTSubPatternHammingDistSaIndex(const BWT *bwt, const unsigned char *convert
 		if (keyLength - i * advance - hitCombination->keyLength >= nextFilteredChar) {
 
 			numOfSaGroup = BWTHammingDistMatch(bwt, convertedKey + keyLength - i*advance - hitCombination->keyLength, hitCombination,
-												  saIndexRange, saIndexRangeNumOfChar,
+												  cachedSaIndex, cachedSaIndexNumOfChar,
 												  saIndexGroup + firstSaIndexGroupForSubPattern[i], maxnumOfSaIndexGroup - firstSaIndexGroupForSubPattern[i]);
 			firstSaIndexGroupForSubPattern[i+1] = firstSaIndexGroupForSubPattern[i] + numOfSaGroup;
 
@@ -2783,9 +3367,6 @@ int BWTDPHit(const BWT *bwt, SaIndexGroupNew* __restrict saIndexGroup, const int
 		}
 		i = j;
 	}
-	if (discardDiagonalHit) {
-		bwtSaRetrievalStatistics->saDiagonalFiltered += numOfHit - n;
-	}
 
 	numOfHit = n;
 	*saIndexGroupProcessed = saIndexGroupLimit - firstSaIndexGroupToProcess;
@@ -2797,7 +3378,7 @@ int BWTDPHit(const BWT *bwt, SaIndexGroupNew* __restrict saIndexGroup, const int
 /*
 unsigned int BWTSubPatternHammingDistMatch(const unsigned char *convertedKey, const unsigned int keyLength, const unsigned int subPatternLength, const BWT *bwt, 
 								  const unsigned int maxError, const unsigned int skip, const unsigned int matchBitVector,
-								  const SaIndexRange *saIndexRange, const unsigned int saIndexRangeNumOfChar,
+								  const SaIndexRange *cachedSaIndex, const unsigned int cachedSaIndexNumOfChar,
 								  char *workingMemory, const unsigned int workingMemorySize, const unsigned int sortOption,
 								  BWTSaRetrievalStatistics* __restrict bwtSaRetrievalStatistics) {
 
@@ -2887,7 +3468,7 @@ unsigned int BWTSubPatternHammingDistMatch(const unsigned char *convertedKey, co
 
 			numOfSaGroup = BWTHammingDistMatch(convertedKey + keyLength - i*advance - subPatternLength, subPatternLength,
 												  bwt, maxError, matchBitVector,
-												  saIndexRange, saIndexRangeNumOfChar,
+												  cachedSaIndex, cachedSaIndexNumOfChar,
 												  saIndexGroup + firstSaIndexGroupForSubPattern[i], maxnumOfSaIndexGroup - firstSaIndexGroupForSubPattern[i]);
 			firstSaIndexGroupForSubPattern[i+1] = firstSaIndexGroupForSubPattern[i] + numOfSaGroup;
 
@@ -3541,11 +4122,10 @@ unsigned int BWTEditDistMatchOld(const unsigned char *convertedKey, const unsign
 	return numOfSaGroup;
 
 }
+/*
 
-
-// This is a version making use of saIndexRange and is with bug
+// This is a version making use of cachedSaIndex and is with bug
 unsigned int BWTEditDistMatch(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int maxError,
-					 const SaIndexRange *saIndexRange, const unsigned int saIndexRangeNumOfChar,
 					 SaIndexGroupWithLengthError* __restrict saIndexGroup, const unsigned int maxSaIndexGroup) {
 
 	// stack
@@ -3592,8 +4172,8 @@ unsigned int BWTEditDistMatch(const unsigned char *convertedKey, const unsigned 
 	#endif
 
 	// Setup for looking up SA index range
-	if (saIndexRangeNumOfChar <= keyLength - maxError) {
-		saIndexRangeLength = saIndexRangeNumOfChar;
+	if (cachedSaIndexNumOfChar <= keyLength - maxError) {
+		saIndexRangeLength = cachedSaIndexNumOfChar;
 	} else {
 		saIndexRangeLength = 0;
 	}
@@ -3637,8 +4217,8 @@ unsigned int BWTEditDistMatch(const unsigned char *convertedKey, const unsigned 
 			// Increment the last error
 			e = errorPos[errorAdded];
 			length = errorPosLength[errorAdded];
-			if (length < saIndexRangeNumOfChar + 1) {
-				saRangeIndex >>= (saIndexRangeNumOfChar - length + 1) * BIT_PER_CHAR;
+			if (length < cachedSaIndexNumOfChar + 1) {
+				saRangeIndex >>= (cachedSaIndexNumOfChar - length + 1) * BIT_PER_CHAR;
 			}
 			generatedPattern[e]++;
 			if (generatedPattern[e] == convertedKey[e]) {
@@ -3678,8 +4258,8 @@ unsigned int BWTEditDistMatch(const unsigned char *convertedKey, const unsigned 
 							startSaIndexBefore[errorAdded] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
 							endSaIndexBefore[errorAdded] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
 						} else {
-							startSaIndexBefore[errorAdded] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-							endSaIndexBefore[errorAdded] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].endSaIndex + 1, c);
+							startSaIndexBefore[errorAdded] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].startSaIndex, c) + 1;
+							endSaIndexBefore[errorAdded] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].endSaIndex + 1, c);
 						}
 					}
 
@@ -3708,8 +4288,8 @@ unsigned int BWTEditDistMatch(const unsigned char *convertedKey, const unsigned 
 	 					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
 						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
 					} else {
-	 					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].endSaIndex + 1, c);
+	 					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].startSaIndex, c) + 1;
+						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].endSaIndex + 1, c);
 					}
 				}
 
@@ -3727,8 +4307,8 @@ unsigned int BWTEditDistMatch(const unsigned char *convertedKey, const unsigned 
 	 							startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndexBefore[errorAdded], c) + 1;
 								endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndexBefore[errorAdded] + 1, c);
 							} else {
-	 							startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndexBefore[errorAdded]].startSaIndex, c) + 1;
-								endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndexBefore[errorAdded]].endSaIndex + 1, c);
+	 							startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndexBefore[errorAdded]].startSaIndex, c) + 1;
+								endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndexBefore[errorAdded]].endSaIndex + 1, c);
 							}
 						}
 					} else {
@@ -3768,8 +4348,8 @@ unsigned int BWTEditDistMatch(const unsigned char *convertedKey, const unsigned 
 	 					startSaIndex[e] = BWTOccValue(bwt, startSaIndex[e], 0) + 1;
 						endSaIndex[e] = BWTOccValue(bwt, endSaIndex[e] + 1, 0);
 					} else {
-	 					startSaIndex[e] = BWTOccValue(bwt, saIndexRange[saRangeIndex].startSaIndex, 0) + 1;
-						endSaIndex[e] = BWTOccValue(bwt, saIndexRange[saRangeIndex].endSaIndex + 1, 0);
+	 					startSaIndex[e] = BWTOccValue(bwt, cachedSaIndex[saRangeIndex].startSaIndex, 0) + 1;
+						endSaIndex[e] = BWTOccValue(bwt, cachedSaIndex[saRangeIndex].endSaIndex + 1, 0);
 					}
 				}
 			}
@@ -3786,8 +4366,8 @@ unsigned int BWTEditDistMatch(const unsigned char *convertedKey, const unsigned 
 						startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, startSaIndex[e+1], c) + 1;
 						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, endSaIndex[e+1] + 1, c);
 					} else {
-	 					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].startSaIndex, c) + 1;
-						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, saIndexRange[saRangeIndex].endSaIndex + 1, c);
+	 					startSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].startSaIndex, c) + 1;
+						endSaIndex[e] = bwt->cumulativeFreq[c] + BWTOccValue(bwt, cachedSaIndex[saRangeIndex].endSaIndex + 1, c);
 					}
 				}
 			}
@@ -3815,7 +4395,7 @@ unsigned int BWTEditDistMatch(const unsigned char *convertedKey, const unsigned 
 	return numOfSaGroup;
 
 }
-
+*/
 unsigned int BWTEliminateDupSaIndexGroup(SaIndexGroupWithLengthError* __restrict saIndexGroup, const unsigned int numOfSaGroup) {
 
 	unsigned int resultnumOfGroup;
@@ -3844,7 +4424,6 @@ unsigned int BWTEliminateDupSaIndexGroup(SaIndexGroupWithLengthError* __restrict
 
 unsigned int BWTSubPatternEditDistMatch(const unsigned char *convertedKey, const unsigned int keyLength, const unsigned int subPatternLength, const BWT *bwt, 
 							   const unsigned int maxError, const unsigned int skip, const unsigned int maxnumOfHit, 
-							   const SaIndexRange *saIndexRange, const unsigned int saIndexRangeNumOfChar,
 							   HitListWithPosQueryLengthError* __restrict hitList, BWTSaRetrievalStatistics* __restrict bwtSaRetrievalStatistics,
 							   const unsigned int eliminateDuplicateStartingPos) {
 
@@ -3887,8 +4466,7 @@ unsigned int BWTSubPatternEditDistMatch(const unsigned char *convertedKey, const
 		}
 
 		if (i * advance + subPatternLength <= nextFilteredChar) {
-			numOfSaGroup = BWTEditDistMatch(convertedKey + i*advance, subPatternLength, bwt, maxError, 
-												saIndexRange, saIndexRangeNumOfChar,
+			numOfSaGroup = BWTEditDistMatchOld(convertedKey + i*advance, subPatternLength, bwt, maxError, 
 												saIndexGroup + totalnumOfSaGroup, maxSaIndexGroup - totalnumOfSaGroup);
 			// Preserve position query information in error
 			numOfHit = 0;
@@ -4816,7 +5394,7 @@ unsigned int BWTDecodeTextPosition(const BWT *bwt, SaIndexList* __restrict evenI
 	unsigned int iteration;
 	unsigned int numOfSaToDecode;
 	unsigned int numOfUndecodedSa, numOfSaProcessed;
-	unsigned int occValue[ALPHABET_SIZE];
+	unsigned int ALIGN_16 occValue[ALPHABET_SIZE];
 	unsigned int undecodedSaBwtCharCount[ALPHABET_SIZE + 1];
 
 	unsigned int firstSaIndex, lastSaIndexInPrevGroup;
@@ -5271,16 +5849,16 @@ void BWTInitializeSaRetrievalStatistics(BWTSaRetrievalStatistics *bwtSaRetrieval
 
 	bwtSaRetrievalStatistics->bwtSaRetrieved = 0;
 	bwtSaRetrievalStatistics->saDiagonalLinked = 0;
-	bwtSaRetrievalStatistics->saDiagonalFiltered = 0;
+	bwtSaRetrievalStatistics->cachedSaRetrieved = 0;
 	bwtSaRetrievalStatistics->saDuplicated = 0;
 
 }
 
 void BWTAllocateDPStatistics(BWTDPStatistics *bwtDPStatistics) {
 
-	bwtDPStatistics->totalNode = MMUnitAllocate((BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(long long));
-	bwtDPStatistics->rejectedNode = MMUnitAllocate((BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(long long));
-	bwtDPStatistics->totalDPCell = MMUnitAllocate((BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(long long));
+	bwtDPStatistics->totalNode = MMUnitAllocate((BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(LONG));
+	bwtDPStatistics->rejectedNode = MMUnitAllocate((BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(LONG));
+	bwtDPStatistics->totalDPCell = MMUnitAllocate((BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(LONG));
 
 }
 
@@ -5309,13 +5887,13 @@ void BWTInitializeDPStatistics(BWTDPStatistics *bwtDPStatistics) {
 void BWTFreeDPStatistics(BWTDPStatistics *bwtDPStatistics) {
 
 	if (bwtDPStatistics->totalNode != NULL) {
-		MMUnitFree(bwtDPStatistics->totalNode, (BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(long long));
+		MMUnitFree(bwtDPStatistics->totalNode, (BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(LONG));
 	}
 	if (bwtDPStatistics->rejectedNode != NULL) {
-		MMUnitFree(bwtDPStatistics->rejectedNode, (BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(long long));
+		MMUnitFree(bwtDPStatistics->rejectedNode, (BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(LONG));
 	}
 	if (bwtDPStatistics->totalDPCell != NULL) {
-		MMUnitFree(bwtDPStatistics->totalDPCell, (BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(long long));
+		MMUnitFree(bwtDPStatistics->totalDPCell, (BWTDP_MAX_SUBSTRING_LENGTH+1) * sizeof(LONG));
 	}
 
 }

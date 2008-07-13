@@ -16,7 +16,7 @@
 #include "r250.h"
 
 // static functions
-static unsigned long int randlcg();
+static unsigned int randlcg();
 
 
 #define MSB          0x80000000L
@@ -28,19 +28,19 @@ static unsigned long int randlcg();
 static unsigned int r250_buffer[ 250 ];
 static int r250_index;
 
-static unsigned long int randlcg(long int sd)       /* returns a random unsigned integer */
+static unsigned int randlcg(int sd)       /* returns a random unsigned integer */
 {
-		static long int quotient1  = LONG_MAX / 16807L;
-		static long int remainder1 = LONG_MAX % 16807L;
+		static int quotient1  = LONG_MAX / 16807L;
+		static int remainder1 = LONG_MAX % 16807L;
 
         if ( sd <= quotient1 )
                 sd = (sd * 16807L) % LONG_MAX;
         else
         {
-                long int high_part = sd / quotient1;
-                long int low_part  = sd % quotient1;
+                int high_part = sd / quotient1;
+                int low_part  = sd % quotient1;
 
-                long int test = 16807L * low_part - remainder1 * high_part;
+                int test = 16807L * low_part - remainder1 * high_part;
 
                 if ( test > 0 )
                         sd = test;

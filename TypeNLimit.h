@@ -45,9 +45,33 @@
 #define FALSE   0
 
 // Compatibilities
-//#define fopen64		fopen			// For compatibility of environment without large file support
-//#define ftello64	ftell			// For compatibility of environment without large file support
-#define INLINE		inline		// For compatibility
+
+#ifdef _WIN32
+
+#define fopen64		fopen
+#define ftello64	ftell
+#define INLINE		__inline
+#define ALIGN_16	__declspec(align(16))
+#define ALIGN_32	__declspec(align(32))
+#define ALIGN_64	__declspec(align(64))
+#define MEMALIGN(a, b)	_aligned_malloc(a, b)
+#define FREEALIGN(a)	_aligned_free(a)
+
+#else
+
+#define fopen64		fopen
+#define ftello64	ftell
+#define INLINE		__inline
+#define ALIGN_16	__attribute__((aligned(16)))
+#define ALIGN_32	__attribute__((aligned(32)))
+#define ALIGN_64	__attribute__((aligned(64)))
+#define MEMALIGN(a, b)	_mm_malloc(a, b)
+#define FREEALIGN(a)	_mm_free(a)
+
+#endif
+
+// To make sure that LONG means 64 bit integer
+#define LONG		long long		// For 32 & 64 bits compatibility on Windows and Linux
 
 #define MAX_FILENAME_LEN 256
 

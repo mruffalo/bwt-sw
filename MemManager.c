@@ -25,16 +25,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <mm_malloc.h>
+#endif
 #include "MiscUtilities.h"
 #include "MemManager.h"
 
 MMMaster mmMaster;
 
-void *MMMalloc(const unsigned int memSize) {
+void *MMMalloc(const size_t memSize) {
 
 	void *address;
 
-	address = malloc(memSize);
+	address = MEMALIGN(memSize, MAX_ALIGN);
 	if (address == NULL) {
 		fprintf(stderr, "MMMalloc() : cannot allocate memory!\n");
 		exit(1);
@@ -45,7 +48,7 @@ void *MMMalloc(const unsigned int memSize) {
 
 void MMFree(void *address) {
 
-	free(address);
+	FREEALIGN(address);
 
 }
 
@@ -62,7 +65,7 @@ void MMMasterInitialize(const unsigned int maxNumberOfPools, const unsigned int 
 	mmMaster.maxNumberOfBulks = maxNumberOfBulks;
 	mmMaster.maxNumberOfPools = maxNumberOfPools;
 	if (maxNumberOfBulks > 0) {
-		mmMaster.mmBulk = malloc(sizeof(MMBulk*) * maxNumberOfBulks);
+		mmMaster.mmBulk = MEMALIGN(sizeof(MMBulk*) * maxNumberOfBulks, MAX_ALIGN);
 		for (i=0; i<maxNumberOfBulks; i++) {
 			mmMaster.mmBulk[i] = NULL;
 		}
@@ -70,7 +73,7 @@ void MMMasterInitialize(const unsigned int maxNumberOfPools, const unsigned int 
 		mmMaster.mmBulk = NULL;
 	}
 	if (maxNumberOfPools > 0) {
-		mmMaster.mmPool = malloc(sizeof(MMPool*) * maxNumberOfPools);
+		mmMaster.mmPool = MEMALIGN(sizeof(MMPool*) * maxNumberOfPools, MAX_ALIGN);
 		for (i=0; i<maxNumberOfPools; i++) {
 			mmMaster.mmPool[i] = NULL;
 		}
@@ -98,25 +101,25 @@ void MMMasterFreeAll() {
 			mmMaster.mmBulk[i] = NULL;
 		}
 	}
-	free(mmMaster.mmBulk);
+	FREEALIGN(mmMaster.mmBulk);
 
 	for (i=0; i < mmMaster.maxNumberOfPools; i++) {
 		if (mmMaster.mmPool[i] != NULL) {
 			if (MMPoolIsActive(mmMaster.mmPool[i])) {
 				MMPoolFree(mmMaster.mmPool[i]);
 			}
-			free(mmMaster.mmPool[i]);
+			FREEALIGN(mmMaster.mmPool[i]);
 			mmMaster.mmPool[i] = NULL;
 		}
 	}
-	free(mmMaster.mmPool);
+	FREEALIGN(mmMaster.mmPool);
 
 }
 
-unsigned int MMMasterCurrentTotalByteAllocated() {
+size_t MMMasterCurrentTotalByteAllocated() {
 
 	unsigned int i;
-	unsigned int currentTotalByteAllocated;
+	size_t currentTotalByteAllocated;
 
 	// unit memory allocated
 	currentTotalByteAllocated = mmMaster.currentUnitByteAllocated;
@@ -139,10 +142,10 @@ unsigned int MMMasterCurrentTotalByteAllocated() {
 
 }
 
-unsigned int MMMasterCurrentTotalByteDispatched() {
+size_t MMMasterCurrentTotalByteDispatched() {
 
 	unsigned int i;
-	unsigned int currentTotalByteDispatched;
+	size_t currentTotalByteDispatched;
 
 	// unit memory dispatched
 	currentTotalByteDispatched = mmMaster.currentUnitByteAllocated;
@@ -165,9 +168,9 @@ unsigned int MMMasterCurrentTotalByteDispatched() {
 
 }
 
-unsigned int MMMasterMaxTotalByteAllocated() {
+size_t MMMasterMaxTotalByteAllocated() {
 
-	unsigned int currentTotalByteAllocated;
+	size_t currentTotalByteAllocated;
 
 	currentTotalByteAllocated = MMMasterCurrentTotalByteAllocated();
 
@@ -179,9 +182,9 @@ unsigned int MMMasterMaxTotalByteAllocated() {
 
 }
 
-unsigned int MMMasterMaxTotalByteDispatched() {
+size_t MMMasterMaxTotalByteDispatched() {
 
-	unsigned int currentTotalByteDispatched ;
+	size_t currentTotalByteDispatched ;
 
 	currentTotalByteDispatched = MMMasterCurrentTotalByteDispatched();
 
@@ -195,7 +198,7 @@ unsigned int MMMasterMaxTotalByteDispatched() {
 
 void MMMasterSetMaxTotalByteAllocated() {
 
-	unsigned int currentTotalByteAllocated;
+	size_t currentTotalByteAllocated;
 	
 	currentTotalByteAllocated = MMMasterCurrentTotalByteAllocated();
 
@@ -207,7 +210,7 @@ void MMMasterSetMaxTotalByteAllocated() {
 
 void MMMasterSetMaxTotalByteDispatched() {
 
-	unsigned int currentTotalByteDispatched;
+	size_t currentTotalByteDispatched;
 	
 	currentTotalByteDispatched = MMMasterCurrentTotalByteDispatched();
 
@@ -249,7 +252,7 @@ void MMMasterPrintReport(FILE *output, const unsigned int withUnitDetails, const
 
 }
 
-void *MMUnitAllocate(const unsigned int memSize) {
+void *MMUnitAllocate(const size_t memSize) {
 
 	void *temp;
 
@@ -260,7 +263,7 @@ void *MMUnitAllocate(const unsigned int memSize) {
 	}
 	#endif
 
-	temp = malloc(memSize);
+	temp = MEMALIGN(memSize, MAX_ALIGN);
 	if (temp == NULL) {
 		fprintf(stderr, "MMUnitAllocate() : cannot allocate memory!\n");
 		exit(1);
@@ -275,7 +278,7 @@ void *MMUnitAllocate(const unsigned int memSize) {
 
 }
 
-void *MMUnitReallocate(void *address, const unsigned int newMemSize, const unsigned int oldMemSize) {
+void *MMUnitReallocate(void *address, const size_t newMemSize, const size_t oldMemSize) {
 
 	void *temp;
 
@@ -290,23 +293,24 @@ void *MMUnitReallocate(void *address, const unsigned int newMemSize, const unsig
 	}
 	#endif
 
-	temp = realloc(address, newMemSize);
+	if (mmMaster.traceUnitByteAllocation) {
+		fprintf(mmMaster.unitByteTraceFile, "MMUnitReallocate\n");
+	}
+
+	temp = MMUnitAllocate(newMemSize);
 	if (temp == NULL) {
 		fprintf(stderr, "MMUnitReallocate() : cannot allocate memory!\n");
 		exit(1);
 	}
+	memcpy(temp, address, min(newMemSize, oldMemSize));
 
-	mmMaster.currentUnitByteAllocated += newMemSize - oldMemSize;
-	if (mmMaster.traceUnitByteAllocation) {
-		fprintf(mmMaster.unitByteTraceFile, "MMUnitReallocate from : %u\n", oldMemSize);
-		fprintf(mmMaster.unitByteTraceFile, "MMUnitReallocate to   : %u\n", newMemSize);
-	}
+	MMUnitFree(address, oldMemSize);
 
 	return temp;
 
 }
 
-void MMUnitFree(void *address, const unsigned int memSize) {
+void MMUnitFree(void *address, const size_t memSize) {
 
 	#ifdef DEBUG
 	if (address == NULL) {
@@ -319,7 +323,7 @@ void MMUnitFree(void *address, const unsigned int memSize) {
 	}
 	#endif
 
-	free(address);
+	FREEALIGN(address);
 
 	#ifdef RECORD_GRAND_TOTAL
 	MMMasterSetMaxTotalByteAllocated();
@@ -336,13 +340,13 @@ void MMUnitFree(void *address, const unsigned int memSize) {
 
 }
 
-unsigned int MMUnitCurrentByteAllocated() {
+size_t MMUnitCurrentByteAllocated() {
 
 	return mmMaster.currentUnitByteAllocated;
 
 }
 
-unsigned int MMUnitMaxByteAllocated() {
+size_t MMUnitMaxByteAllocated() {
 
 	if (mmMaster.currentUnitByteAllocated > mmMaster.maxUnitByteAllocated) {
 		return mmMaster.currentUnitByteAllocated;
@@ -371,20 +375,19 @@ MMPool *MMPoolCreate(const unsigned int poolSize) {
 	}
 	#endif
 
-	mmPool = malloc(poolSize);
+	if (poolSize / MAX_ALIGN * MAX_ALIGN != poolSize) {
+		fprintf(stderr, "MMPoolCreate() : poolSize must be multiple of MAX_ALIGN (%d)!\n", MAX_ALIGN);	// Otherwise temp memory is not properly aligned
+		exit(1);
+	}
+
+	mmPool = MEMALIGN(poolSize, MAX_ALIGN);
 	if (mmPool == NULL) {
 		fprintf(stderr, "MMPoolCreate() : cannot allocate memory!\n");
 		exit(1);
 	}
 
-	if (poolSize / MAX_ALIGN * MAX_ALIGN != poolSize) {
-		fprintf(stderr, "MMPoolCreate() : poolSize must be multiple of MAX_ALIGN (%d)!\n", MAX_ALIGN);
-		exit(1);
-	}
-
 	mmPool->poolSize = poolSize;
 	mmPool->poolByteDispatched = sizeof(MMPool);
-	mmPool->poolByteSkippedForAlign = 0;
 	mmPool->poolByteSpillover = 0;
 	mmPool->firstSpillOverAddress = NULL;
 	mmPool->currentTempByteDispatched = 0;
@@ -472,7 +475,7 @@ MMPool *MMPoolFree(MMPool *mmPool) {
 	MMMasterSetMaxTotalByteDispatched();
 	#endif
 
-	dummyMMPool = malloc(sizeof(MMPool));
+	dummyMMPool = MEMALIGN(sizeof(MMPool), MAX_ALIGN);
 	if (dummyMMPool == NULL) {
 		fprintf(stderr, "MMPoolFree() : cannot allocate memory!\n");
 		exit(1);
@@ -482,7 +485,7 @@ MMPool *MMPoolFree(MMPool *mmPool) {
 	temp1 = mmPool->firstSpillOverAddress;
 	while (temp1 != NULL) {
 		temp2 = *((void**)temp1);
-		free(temp1);
+		FREEALIGN(temp1);
 		temp1 = temp2;
 	}
 	mmPool->firstSpillOverAddress = NULL;
@@ -493,7 +496,6 @@ MMPool *MMPoolFree(MMPool *mmPool) {
 	dummyMMPool->currentTempByteSpillover = mmPool->currentTempByteSpillover;
 	dummyMMPool->firstSpillOverAddress = mmPool->firstSpillOverAddress;
 	dummyMMPool->maxTotalByteDispatched = mmPool->maxTotalByteDispatched;
-	dummyMMPool->poolByteSkippedForAlign = mmPool->poolByteSkippedForAlign;
 	dummyMMPool->poolSize = mmPool->poolSize;
 
 	MMPoolSetInactive(dummyMMPool);
@@ -502,7 +504,7 @@ MMPool *MMPoolFree(MMPool *mmPool) {
 	for (i=0; i<mmMaster.maxNumberOfPools; i++) {
 		if (mmMaster.mmPool[i] == mmPool) {
 			mmMaster.mmPool[i] = dummyMMPool;
-			free(mmPool);
+			FREEALIGN(mmPool);
 			return dummyMMPool;
 		}
 	}
@@ -532,7 +534,7 @@ void MMPoolReset(MMPool *mmPool) {
 	temp1 = mmPool->firstSpillOverAddress;
 	while (temp1 != NULL) {
 		temp2 = *((void**)temp1);
-		free(temp1);
+		FREEALIGN(temp1);
 		temp1 = temp2;
 	}
 
@@ -542,7 +544,6 @@ void MMPoolReset(MMPool *mmPool) {
 	mmPool->currentTempByteSpillover = 0;
 	mmPool->firstSpillOverAddress = NULL;
 	mmPool->maxTotalByteDispatched = 0;
-	mmPool->poolByteSkippedForAlign = 0;
 
 }
 
@@ -568,7 +569,7 @@ void MMPoolDestory(MMPool *mmPool) {
 	for (i=0; i<mmMaster.maxNumberOfPools; i++) {
 		if (mmMaster.mmPool[i] == temp) {
 			mmMaster.mmPool[i] = NULL;
-			free(temp);
+			FREEALIGN(temp);
 			temp = NULL;
 		}
 	}
@@ -606,17 +607,16 @@ void *MMPoolDispatch(MMPool *mmPool, const unsigned int memSize) {
 	if (align < MIN_ALIGN) {
 		align = MIN_ALIGN;
 	}
-	skipForAlign = downwardAlign(nextPoolMemoryOffset, align) - nextPoolMemoryOffset;
+	skipForAlign = nextAlignedBoundary(nextPoolMemoryOffset, align) - nextPoolMemoryOffset;
 
 	if (totalPoolMemoryUsed + memSize + skipForAlign <= mmPool->poolSize) {
 		temp = (void**)(((char*)mmPool) + nextPoolMemoryOffset + skipForAlign);
-		mmPool->poolByteSkippedForAlign += skipForAlign;
 		mmPool->poolByteDispatched += memSize + skipForAlign;
 		return temp;
 	} else {
 		// Spillover
 		// Allocate for linked list pointer as well
-		temp = malloc(memSize + sizeof(void*));
+		temp = MEMALIGN(memSize + MAX_ALIGN, MAX_ALIGN);	// spillover memory is always aligned to MAX_ALIGN
 		if (temp == NULL) {
 			fprintf(stderr, "MMPoolDispatch(): cannot allocate memory!\n");
 			exit(1);
@@ -624,11 +624,50 @@ void *MMPoolDispatch(MMPool *mmPool, const unsigned int memSize) {
 		// Add spillover memory to linked list
 		*temp = mmPool->firstSpillOverAddress;
 		mmPool->firstSpillOverAddress = temp;
-		mmPool->poolByteSpillover += memSize;
-		mmPool->poolByteDispatched += memSize;
-		return (char*)temp + sizeof(void*);
+		mmPool->poolByteSpillover += memSize + MAX_ALIGN;
+		mmPool->poolByteDispatched += memSize + MAX_ALIGN;
+		return (char*)temp + MAX_ALIGN;
 	}
 		
+}
+
+unsigned int MMPoolDispatchOffset(MMPool *mmPool, const unsigned int memSize) {
+
+	unsigned int totalPoolMemoryUsed, nextPoolMemoryOffset;
+	unsigned int align, skipForAlign;
+
+	if (mmPool == NULL) {
+		fprintf(stderr, "MMPoolDispatchOffset(): mmPool == NULL!\n");
+		exit(1);
+	}
+	if (memSize == 0) {
+		fprintf(stderr, "MMPoolDispatchOffset(): memSize = 0!\n");
+		exit(1);
+	}
+
+	totalPoolMemoryUsed = mmPool->poolByteDispatched - mmPool->poolByteSpillover +
+						  mmPool->currentTempByteDispatched - mmPool->currentTempByteSpillover;
+	nextPoolMemoryOffset = mmPool->poolByteDispatched - mmPool->poolByteSpillover;
+
+	// Calculate the number of byte to skip in order to align the memory dispatched
+	align = 1 << (BITS_IN_WORD - leadingZero(memSize - 1));
+	if (align > MAX_ALIGN) {
+		align = MAX_ALIGN;
+	}
+	if (align < MIN_ALIGN) {
+		align = MIN_ALIGN;
+	}
+	skipForAlign = nextAlignedBoundary(nextPoolMemoryOffset, align) - nextPoolMemoryOffset;
+
+	if (totalPoolMemoryUsed + memSize + skipForAlign > mmPool->poolSize) {
+		fprintf(stderr, "MMPoolDispatchOffset(): Not enough memory in memory pool!\n");
+		exit(1);
+	}
+
+	mmPool->poolByteDispatched += memSize + skipForAlign;
+
+	return nextPoolMemoryOffset + skipForAlign;
+
 }
 
 void MMPoolReturn(MMPool *mmPool, void *address, const unsigned int memSize) {
@@ -643,7 +682,6 @@ void MMPoolPrintReport(MMPool *mmPool, FILE *output) {
 
 	fprintf(output, "Pool Size     : %u\n", mmPool->poolSize);
 	fprintf(output, "   Dispatched : %u\n", mmPool->poolByteDispatched);
-	fprintf(output, "     - Skipped for alignment : %u\n", mmPool->poolByteSkippedForAlign);
 	fprintf(output, "     - Spillover             : %u\n", mmPool->poolByteSpillover);
 	fprintf(output, "Maximum amount of memory dispatched including temp memory : %u\n", 
 			MMPoolMaxTotalByteDispatched(mmPool));
@@ -665,7 +703,7 @@ void *MMTempDispatch(MMPool *mmPool, const unsigned int memSize) {
 		exit(1);
 	}
 
-	alignedMemSize = downwardAlign(memSize, MAX_ALIGN);
+	alignedMemSize = nextAlignedBoundary(memSize, MAX_ALIGN);	// temp memory is always aligned to MAX_ALIGN
 
 	totalPoolMemoryUsed = mmPool->poolByteDispatched - mmPool->poolByteSpillover +
 						  mmPool->currentTempByteDispatched - mmPool->currentTempByteSpillover;
@@ -685,16 +723,16 @@ void *MMTempDispatch(MMPool *mmPool, const unsigned int memSize) {
 			temp = (void**)*pointerToLastSpilloverAddress;
 		}
 		// Allocate for linked list pointer as well
-		temp = malloc(memSize + sizeof(void*));
+		temp = MEMALIGN(memSize + MAX_ALIGN, MAX_ALIGN);
 		if (temp == NULL) {
 			fprintf(stderr, "MMTempDispatch(): cannot allocate memory!\n");
 			exit(1);
 		}
 		*pointerToLastSpilloverAddress = temp;
 		*temp = NULL;
-		mmPool->currentTempByteDispatched += memSize;
-		mmPool->currentTempByteSpillover += memSize;
-		return (char*)temp + sizeof(void*);
+		mmPool->currentTempByteDispatched += memSize + MAX_ALIGN;
+		mmPool->currentTempByteSpillover += memSize + MAX_ALIGN;
+		return (char*)temp + MAX_ALIGN;
 	}
 		
 }
@@ -710,7 +748,7 @@ void MMTempReturn(MMPool *mmPool, void *address, const unsigned int memSize) {
 		MMUnitFree(address, memSize);
 	} else {
 
-		alignedMemSize = downwardAlign(memSize, MAX_ALIGN);
+		alignedMemSize = nextAlignedBoundary(memSize, MAX_ALIGN);
 
 		if (address >= (void*)mmPool && address <= (void*)((char*)mmPool + mmPool->poolSize)) {
 			// No need to record the global level max memory dispatched/allocated
@@ -725,7 +763,7 @@ void MMTempReturn(MMPool *mmPool, void *address, const unsigned int memSize) {
 			MMMasterSetMaxTotalByteDispatched();
 			#endif
 			// Spillover
-			spilloverPointerAddress = (void*)((char*)address - sizeof(void*));
+			spilloverPointerAddress = (void*)((char*)address - MAX_ALIGN);	// MAX_ALIGN no. of bytes preceding temp address
 			// Locate the last spillover memory
 			pointerToLastButOneSpillover = &(mmPool->firstSpillOverAddress);
 			temp = (void**)(*pointerToLastButOneSpillover);
@@ -734,17 +772,17 @@ void MMTempReturn(MMPool *mmPool, void *address, const unsigned int memSize) {
 				temp = (void**)*pointerToLastButOneSpillover;
 			}
 			if (*pointerToLastButOneSpillover != spilloverPointerAddress) {
-				fprintf(stderr, "MMTempReturn(): address != lastSpilloverAddress!\n");
+				fprintf(stderr, "MMTempReturn(): address != lastSpilloverAddress! Last allocated temp memory must be freed first\n");
 				exit(1);
 			}
-			free(spilloverPointerAddress);
+			FREEALIGN(spilloverPointerAddress);
 			*pointerToLastButOneSpillover = NULL;
 
 			if (mmPool->poolByteDispatched + mmPool->currentTempByteDispatched > mmPool->maxTotalByteDispatched) {
 				mmPool->maxTotalByteDispatched = mmPool->poolByteDispatched + mmPool->currentTempByteDispatched;
 			}
-			mmPool->currentTempByteDispatched -= memSize;
-			mmPool->currentTempByteSpillover -= memSize;
+			mmPool->currentTempByteDispatched -= memSize + MAX_ALIGN;
+			mmPool->currentTempByteSpillover -= memSize + MAX_ALIGN;
 		}
 
 	}
@@ -795,7 +833,7 @@ MMBulk *MMBulkCreate(MMPool *mmPool, const unsigned int itemSize, const unsigned
 	}
 
 	//Allocate memory for the first directory entry
-	mmBulk->directory[0] = malloc(boundaryCushionSize * 2 + (itemSize << itemPerAllocationInPowerOf2));
+	mmBulk->directory[0] = MEMALIGN(boundaryCushionSize * 2 + (itemSize << itemPerAllocationInPowerOf2), MAX_ALIGN);
 	if (mmBulk->directory[0] == NULL) {
 		fprintf(stderr, "MMBulkCreate() : cannot allocate memory!\n");
 		exit(1);
@@ -862,7 +900,7 @@ void MMBulkFree(MMBulk *mmBulk) {
 	#endif
 
 	for (i=0; i<=mmBulk->currentDirectoryEntry; i++) {
-		free(mmBulk->directory[i] - mmBulk->boundaryCushionSize);
+		FREEALIGN(mmBulk->directory[i] - mmBulk->boundaryCushionSize);
 	}
 
 	if (MMBulkFindPoolUsed(mmBulk) == NULL) {
@@ -919,7 +957,7 @@ unsigned int MMBulkDispatch(MMBulk *mmBulk) {
 			exit(1);
 		}
 		//Allocate memory for the next directory entry
-		mmBulk->directory[mmBulk->currentDirectoryEntry] = malloc(mmBulk->boundaryCushionSize * 2 + (mmBulk->itemSize << mmBulk->itemPerAllocationInPowerOf2));
+		mmBulk->directory[mmBulk->currentDirectoryEntry] = MEMALIGN(mmBulk->boundaryCushionSize * 2 + (mmBulk->itemSize << mmBulk->itemPerAllocationInPowerOf2), MAX_ALIGN);
 		if (mmBulk->directory[mmBulk->currentDirectoryEntry] == NULL) {
 			fprintf(stderr, "MMBulkDispatch() : cannot allocate memory!\n");
 			exit(1);
@@ -1016,8 +1054,8 @@ MMBulk *MMBulkLoad(MMPool *mmPool, FILE *input) {
 	mmBulk->directory = MMPoolDispatch(mmPool, sizeof(unsigned char*) * mmBulk->directorySize);
 
 	for (i=0; i<mmBulk->currentDirectoryEntry; i++) {
-		mmBulk->directory[i] = malloc(mmBulk->boundaryCushionSize * 2 + 
-									(mmBulk->itemSize << mmBulk->itemPerAllocationInPowerOf2));
+		mmBulk->directory[i] = MEMALIGN(mmBulk->boundaryCushionSize * 2 + 
+									(mmBulk->itemSize << mmBulk->itemPerAllocationInPowerOf2), MAX_ALIGN);
 		if (mmBulk->directory[i] == NULL) {
 			fprintf(stderr, "MMBulkLoad() : cannot allocate memory!\n");
 			exit(1);
@@ -1029,8 +1067,8 @@ MMBulk *MMBulkLoad(MMPool *mmPool, FILE *input) {
 		fread(mmBulk->directory[i], mmBulk->itemSize << mmBulk->itemPerAllocationInPowerOf2, 1, input);
 	}
 
-	mmBulk->directory[i] = malloc(mmBulk->boundaryCushionSize * 2 + 
-								(mmBulk->itemSize << mmBulk->itemPerAllocationInPowerOf2));
+	mmBulk->directory[i] = MEMALIGN(mmBulk->boundaryCushionSize * 2 + 
+								(mmBulk->itemSize << mmBulk->itemPerAllocationInPowerOf2), MAX_ALIGN);
 	if (mmBulk->directory[i] == NULL) {
 		fprintf(stderr, "MMBulkLoad() : cannot allocate memory!\n");
 		exit(1);

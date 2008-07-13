@@ -255,9 +255,9 @@ int QSortUnsignedIntOrder(const void *data, const int index1, const int index2) 
 
 }
 
-static void QSortSwap(void* __restrict data, const size_t dataWidth, const int index1, const int index2) {
+static void QSortSwap(void* __restrict data, const int dataWidth, const int index1, const int index2) {
 
-	size_t k;
+	int k;
 	char temp;
 
 	for (k=0; k<dataWidth; k++) {
@@ -268,7 +268,7 @@ static void QSortSwap(void* __restrict data, const size_t dataWidth, const int i
 
 }
 
-void QSort(void* __restrict data, const int numData, const size_t dataWidth, int (*QSortComp)(const void*, const int, const int) ) {
+void QSort(void* __restrict data, const int numData, const int dataWidth, int (*QSortComp)(const void*, const int, const int) ) {
 
 	#define SMALL_ARRAY_SIZE	8	// Use insertion sort if data array size is smaller than or equal to SMALL_ARRAY_SIZE
 	#define EQUAL_KEY_THRESHOLD	4	// Partition for equal key if data array size / the number of data with equal value with partition key < EQUAL_KEY_THRESHOLD
@@ -549,19 +549,72 @@ void formatVALAsBinary(const unsigned int input, char* output, unsigned int bitG
 unsigned int getRandomSeed() {
 
 	time_t timer;
-	time_t mask;
-
-	mask = (time_t)1 << 32;
 
 	time(&timer);
-
-	if (mask == 0) {
-		return (unsigned int)(timer);
+	if (sizeof(time_t) > sizeof(unsigned int)) {
+		return (unsigned int)(timer % 0xFFFFFFFF);
 	} else {
-		return (unsigned int)(timer % mask);
+		return (unsigned int)(timer);
 	}
 
 }
+
+void ConvertBytePackedDNAToWordPacked(const unsigned char *input, unsigned int *output, const unsigned int textLength) {
+/*
+	unsigned int i, j, k;
+	unsigned int c;
+	unsigned int bitPerBytePackedChar;
+	unsigned int bitPerWordPackedChar;
+	unsigned int charPerWord;
+	unsigned int charPerByte;
+	unsigned int bytePerIteration;
+	unsigned int byteProcessed = 0;
+	unsigned int wordProcessed = 0;
+	unsigned int mask, shift;
+	
+	unsigned int buffer[BITS_IN_WORD];
+
+	unsigned char tempChar[4];
+
+	bitPerBytePackedChar = BitPerBytePackedChar(alphabetSize);
+	bitPerWordPackedChar = BitPerWordPackedChar(alphabetSize);
+	charPerByte = BITS_IN_BYTE / bitPerBytePackedChar;
+	charPerWord = BITS_IN_WORD / bitPerWordPackedChar;
+
+	bytePerIteration = charPerWord / charPerByte;
+	mask = truncateRight(ALL_ONE_MASK, BITS_IN_WORD - bitPerWordPackedChar);
+	shift = BITS_IN_WORD - BITS_IN_BYTE + bitPerBytePackedChar - bitPerWordPackedChar;
+
+	while ((wordProcessed + 1) * CHAR_PER_WORD < textLength) {
+
+		memcpy(tempChar, input[wordProcessed], 4);
+		output[wordProcessed] = tempChar[0] << 24 | tempChar[1] << 16 | tempChar[2] << 8 | tempChar[3];
+		wordProcessed++;
+
+	}
+
+	k = 0;
+	for (i=0; i < (textLength - wordProcessed * CHAR_PER_WORD - 1) / CHAR_PER_BYTE + 1; i++) {
+		c = (unsigned int)input[byteProcessed] << shift;
+		for (j=0; j<charPerByte; j++) {
+			buffer[k] = c & mask;
+			c <<= bitPerBytePackedChar;
+			k++;
+		}
+		byteProcessed++;
+	}
+
+	c = 0;
+	for (i=0; i<textLength - wordProcessed * charPerWord; i++) {
+		c |= buffer[i] >> bitPerWordPackedChar * i;
+	}
+	output[wordProcessed] = c;
+
+*/
+
+}
+
+
 
 unsigned int reverseBit(unsigned int x)
 {

@@ -224,11 +224,11 @@ int main(int argc, char** argv) {
 	double elapsedTime = 0, totalQueryTime = 0;
 	double databaseLoadTime, totalSearchTime, totalTextDecodeTime, totalUngappedExtensionTime, totalGappedExtensionTime1, totalGappedExtensionTime2, totalPrintTime;
 	double queryStartTime;
-	long long totalSaIndexRange, totalHitGenerated, totalUngappedHit, totalUniqueUngappedHit;
-	long long totalGappedHit, totalNonCrossBoundaryGappedHit, totalUniqueGappedHit;
-	long long totalGappedHitWithTraceback, totalFinalHit;
-	long long totalNumOfUnmaskedChar, totalNumOfChar;
-	long long totalNumOfDPPoint;
+	LONG totalSaIndexRange, totalHitGenerated, totalUngappedHit, totalUniqueUngappedHit;
+	LONG totalGappedHit, totalNonCrossBoundaryGappedHit, totalUniqueGappedHit;
+	LONG totalGappedHitWithTraceback, totalFinalHit;
+	LONG totalNumOfUnmaskedChar, totalNumOfChar;
+	LONG totalNumOfDPPoint;
 
 	// Count Histogram statistic by score
 	Histogram *histogram;
@@ -418,7 +418,7 @@ int main(int argc, char** argv) {
 
 		// Open extra alignment file
 		if (AlignFileName[0] != ' ' && AlignFileName[0] != '-' && AlignFileName[0] != '\0') {
-			alignFile = fopen(AlignFileName, "w");
+			alignFile = fopen64(AlignFileName, "w");
 			if (alignFile == NULL) {
 				fprintf(stderr, "Cannot open alignment file %s!\n", AlignFileName);
 				exit(1);
@@ -429,7 +429,7 @@ int main(int argc, char** argv) {
 
 		// Open timing file
 		if (TimingFileName[0] != ' ' && TimingFileName[0] != '-' && TimingFileName[0] != '\0') {
-			timingFile = fopen(TimingFileName, "a");
+			timingFile = fopen64(TimingFileName, "a");
 			if (timingFile == NULL) {
 				fprintf(stderr, "Cannot open timing file %s!\n", TimingFileName);
 				exit(1);
@@ -445,7 +445,7 @@ int main(int argc, char** argv) {
 	fflush(stdout);
 
 	bwt = BWTLoad(mmPool, BWTCodeFileName, BWTOccValueFileName, SaValueFileName, NULL, NULL, NULL);
-	hsp = HSPLoad(mmPool, PackedDNAFileName, AnnotationFileName, AmbiguityFileName);
+	hsp = HSPLoad(mmPool, PackedDNAFileName, AnnotationFileName, AmbiguityFileName, 1);
 	if (bwt->textLength != hsp->dnaLength) {
 		fprintf(stderr, "BWT-SW: Database length inconsistent!\n");
 		exit(1);
@@ -571,7 +571,7 @@ int main(int argc, char** argv) {
 
 			// Open extra alignment file
 			if (AlignFileName[0] != ' ' && AlignFileName[0] != '-' && AlignFileName[0] != '\0') {
-				alignFile = fopen(AlignFileName, "w");
+				alignFile = fopen64(AlignFileName, "w");
 				if (alignFile == NULL) {
 					Socketfprintf(stderr, "Cannot open alignment file %s!\n", AlignFileName);
 					SocketEndConnection(bwtServerSocket);
@@ -583,7 +583,7 @@ int main(int argc, char** argv) {
 
 			// Open timing file
 			if (TimingFileName[0] != ' ' && TimingFileName[0] != '-' && TimingFileName[0] != '\0') {
-				timingFile = fopen(TimingFileName, "a");
+				timingFile = fopen64(TimingFileName, "a");
 				if (timingFile == NULL) {
 					Socketfprintf(stderr, "Cannot open timing file %s!\n", TimingFileName);
 					SocketEndConnection(bwtServerSocket);
@@ -985,17 +985,17 @@ int main(int argc, char** argv) {
 				HSPCountEvalueToHistogram(histogram, finalHitListAllContext, numOfHitForQuery, TRUE);
 
 				// Output results
-				HSPPrintAlignment(workingMemoryPool, outputFile, finalHitListAllContext, numOfHitForQuery,
+				HSPPrintAlignment(workingMemoryPool, outputFile, alignmentPool, finalHitListAllContext, numOfHitForQuery,
 								  OutputFormat, contextInfo, 
 								  charMap, complementMap,
 								  queryPatternName, queryPattern, queryPatternLength,
-								  dbOrder, hsp->seqOffset, hsp->annotation);
+								  dbOrder, hsp);
 				if (alignFile != NULL) {
-					HSPPrintAlignment(workingMemoryPool, alignFile, finalHitListAllContext, numOfHitForQuery,
+					HSPPrintAlignment(workingMemoryPool, alignFile, alignmentPool, finalHitListAllContext, numOfHitForQuery,
 									  OUTPUT_PAIRWISE, contextInfo, 
 									  charMap, complementMap,
 									  queryPatternName, queryPattern, queryPatternLength,
-									  dbOrder, hsp->seqOffset, hsp->annotation);
+									  dbOrder, hsp);
 				}
 
 				// Alignment and auxiliary text are freed through alignmentPool
@@ -1095,7 +1095,7 @@ int main(int argc, char** argv) {
 
 	MMUnitFree(queryPattern, queryPatternAllocated);
 
-	HSPFree(mmPool, hsp);
+	HSPFree(mmPool, hsp, 1);
 	BWTFree(mmPool, bwt);
 
 	MMPoolFree(mmPool);

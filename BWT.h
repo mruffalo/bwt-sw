@@ -38,6 +38,7 @@
 #define BITS_PER_OCC_VALUE			16
 #define OCC_VALUE_PER_WORD			2
 #define OCC_INTERVAL				256
+#define WORD_BETWEEN_OCC			16
 #define OCC_INTERVAL_MAJOR			65536
 
 #define SORT_ALL					0
@@ -48,14 +49,13 @@
 #define NUM_BUCKET					65536
 
 #define MAX_APPROX_MATCH_ERROR	7
-#define MAX_ARPROX_MATCH_LENGTH	32
+#define MAX_ARPROX_MATCH_LENGTH	64
 
 #define BWTDP_MAX_SUBSTRING_LENGTH	512
 
-typedef struct SaIndexRange {
-	unsigned int startSaIndex;
-	unsigned int endSaIndex;
-} SaIndexRange;
+#define ESTIMATED_OCC_DIFF			32	// 128 / 4
+#define MAX_OCC_DIFF				128
+
 
 
 typedef struct BWT {
@@ -69,17 +69,17 @@ typedef struct BWT {
 	unsigned int *occValueMajor;		// Occurrence values stored explicitly
 	unsigned int *saValue;				// SA values stored explicitly
 	unsigned int *inverseSa;			// Inverse SA stored explicitly
-	SaIndexRange *saIndexRange;			// SA index range
-	int saIndexRangeNumOfChar;			// Number of characters indexed in SA index range
+	unsigned int *cachedSaIndex;		// Cached SA index
+	unsigned int cachedSaIndexNumOfChar;	// Number of characters indexed in SA index range
 	unsigned int *saValueOnBoundary;	// Pre-calculated frequently referred data
 	unsigned int *decodeTable;			// For decoding BWT by table lookup
 	unsigned int decodeTableGenerated;	// == TRUE if decode table is generated on load and will be freed
 	unsigned int bwtSizeInWord;			// Temporary variable to hold the memory allocated
 	unsigned int occSizeInWord;			// Temporary variable to hold the memory allocated
 	unsigned int occMajorSizeInWord;	// Temporary variable to hold the memory allocated
-	unsigned int saValueSize;			// Temporary variable to hold the memory allocated
-	unsigned int inverseSaSize;			// Temporary variable to hold the memory allocated
-	unsigned int saIndexRangeSize;		// Temporary variable to hold the memory allocated
+	unsigned int saValueSizeInWord;		// Temporary variable to hold the memory allocated
+	unsigned int inverseSaSizeInWord;	// Temporary variable to hold the memory allocated
+	unsigned int cachedSaIndexSizeInWord;	// Temporary variable to hold the memory allocated
 } BWT;
 
 #define MAX_DIAGONAL_LEVEL 4				// Number of sub-pattern to keep for detecting diagonal hit
@@ -98,6 +98,13 @@ typedef struct SaIndexGroupNew {	// SA index range and information of a particul
 	unsigned int posQuery;				// position in query; used for detecting diagonal hits
 	unsigned int info;					// extra hit information; to be copied to hitList.info
 } SaIndexGroupNew;
+
+typedef struct SaIndexGroupTemp {	// SA index range and information of a particular error arrangement of a matched sub-pattern
+	unsigned int startSaIndex1;			// starting SA index
+	unsigned int numOfMatch1;			// number of match
+	unsigned int startSaIndex2;			// position in query; used for detecting diagonal hits
+	unsigned int numOfMatch2;			// extra hit information; to be copied to hitList.info
+} SaIndexGroupTemp;
 
 typedef struct SaIndexGroupOld {	// SA index range and information of a particular error arrangement of a matched sub-pattern
 	unsigned int startSaIndex;			// starting SA index
@@ -145,8 +152,8 @@ typedef struct SaIndexGroupHash {	// Hash table for checking duplicate SA index 
 typedef struct BWTSaRetrievalStatistics {
 	unsigned int bwtSaRetrieved;
 	unsigned int saDiagonalLinked;
-	unsigned int saDiagonalFiltered;
 	unsigned int saDuplicated;
+	unsigned int cachedSaRetrieved;
 } BWTSaRetrievalStatistics;
 
 typedef struct BWTDPStatistics {
@@ -156,13 +163,13 @@ typedef struct BWTDPStatistics {
 	int totalMaxDepth;
 	int totalMaxDPCell;
 	int totalMaxDPMemoryInWord;
-	long long acceptedPathDepth;
-	long long acceptedPath;
-	long long rejectedPathDepth;
-	long long rejectedPath;
-	long long* __restrict totalNode;
-	long long* __restrict rejectedNode;
-	long long* __restrict totalDPCell;
+	LONG acceptedPathDepth;
+	LONG acceptedPath;
+	LONG rejectedPathDepth;
+	LONG rejectedPath;
+	LONG* __restrict totalNode;
+	LONG* __restrict rejectedNode;
+	LONG* __restrict totalDPCell;
 } BWTDPStatistics;
 
 typedef struct SaIndexList {
@@ -182,10 +189,11 @@ typedef struct HitCombination {
 
 typedef struct DPText {
 	int charBeingProcessed;
-	unsigned int saIndexLeft[ALPHABET_SIZE];
-	unsigned int saIndexRight[ALPHABET_SIZE];
 	int dpCellIndex;
 	int numOfDpCellSegment;
+	unsigned int dummy1;	// Must not be removed; so that saIndexLeft and saIndexRight are aligned to 16 byte boundary
+	unsigned int saIndexLeft[ALPHABET_SIZE];
+	unsigned int saIndexRight[ALPHABET_SIZE];
 } DPText;
 
 typedef struct DPScanDepth {
@@ -207,6 +215,8 @@ void BWTGenerateSaValueOnBoundary(MMPool *mmPool, BWT *bwt);
 
 // Core functions
 // The following must be customized for differenet compression schemes ***
+unsigned int BWTDecode(const BWT *bwt, const unsigned int index1, const unsigned int index2, const unsigned int character);
+void BWTDecodeAll(const BWT *bwt, const unsigned int index1, const unsigned int index2, unsigned int* __restrict occValue);
 unsigned int BWTOccValue(const BWT *bwt, unsigned int index, const unsigned int character);
 void BWTOccValueTwoIndex(const BWT *bwt, unsigned int index1, unsigned int index2, const unsigned int character, unsigned int* __restrict occValue);
 void BWTAllOccValue(const BWT *bwt, unsigned int index, unsigned int* __restrict occValue);
@@ -234,9 +244,8 @@ unsigned int BWTOccValueMajorSizeInWord(const unsigned int numChar);
 int BWTForwardSearch(const unsigned int *packedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int *packedText);
 int BWTForwardSearchSaIndex(const unsigned int *packedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int *packedText, 
 					 unsigned int *resultSaIndexLeft, unsigned int *resultSaIndexRight);
-int BWTForwardSearchNoText(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt);
-int BWTForwardSearchSaIndexNoText(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, 
-					 unsigned int *resultSaIndexLeft, unsigned int *resultSaIndexRight);
+int BWTSaBinarySearch(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int *packedText, 
+					  unsigned int *resultSaIndexLeft, unsigned int *resultSaIndexRight, unsigned int *tempKey);	// tempKey = buffer large enough to hold packed key
 int BWTBackwardSearch(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, 
 					  unsigned int *resultSaIndexLeft, unsigned int *resultSaIndexRight);
 int BWTBackwardSearchCheckWithText(const unsigned char *convertedKey, const unsigned int *packedKey, const unsigned int keyLength,
@@ -246,17 +255,16 @@ int BWTBackwardSearchCheckWithText(const unsigned char *convertedKey, const unsi
 
 // Approximate match functions - brute force deep first search by backward search is used
 unsigned int BWTHammingDistMaxSaIndexGroup(const unsigned int keyLength, const unsigned int maxError);
-unsigned int BWTHammingDistCountOcc(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int maxError, const unsigned int matchBitVector);
+unsigned int BWTHammingDistCountOcc(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int maxError);
 unsigned int BWTHammingDistMatch(const BWT *bwt, const unsigned char *convertedKey, const HitCombination *hitCombination,
-						const SaIndexRange *saIndexRange, const unsigned int saIndexRangeNumOfChar,
+						const unsigned int *cachedSaIndex, const unsigned int cachedSaIndexNumOfChar,
 						SaIndexGroupNew* __restrict saIndexGroup, const unsigned int maxSaIndexGroup);
-int BWTHammingDistMatchOld(const unsigned char *convertedKey, const int keyLength, const BWT *bwt, const int maxError,
-						   SaIndexGroupNew* __restrict saIndexGroup, const int maxSaIndexGroup,
+int BWTHammingDistMatchOld(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int maxError,
+						   SaIndexGroupNew* __restrict saIndexGroup, const unsigned int maxSaIndexGroup,
 						   const unsigned int posQuery, const unsigned int info);
 unsigned int BWTEditDistMaxSaIndexGroup(const unsigned int keyLength, const unsigned int maxError);
 // Does not insert characters on pattern boundary
 unsigned int BWTEditDistMatch(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int maxError,
-					 const SaIndexRange *saIndexRange, const unsigned int saIndexRangeNumOfChar,
 					 SaIndexGroupWithLengthError* __restrict saIndexGroup, const unsigned int maxSaIndexGroup);
 unsigned int BWTEditDistMatchOld(const unsigned char *convertedKey, const unsigned int keyLength, const BWT *bwt, const unsigned int maxError,
 					 SaIndexGroupWithLengthError* __restrict saIndexGroup, const unsigned int maxSaIndexGroup);
@@ -265,10 +273,10 @@ unsigned int BWTEditDistMatchOld(const unsigned char *convertedKey, const unsign
 unsigned int BWTEliminateDupSaIndexGroup(SaIndexGroupWithLengthError* __restrict saIndexGroup, const unsigned int numOfSaGroup);
 
 unsigned int BWTSubPatternHammingDistCountOcc(const unsigned char *convertedKey, const unsigned int keyLength, const unsigned int subPatternLength, const BWT *bwt, 
-								     const unsigned int maxError, const unsigned int skip, const unsigned int matchBitVector);
+								     const unsigned int maxError, const unsigned int skip);
 int BWTSubPatternHammingDistSaIndex(const BWT *bwt, const unsigned char *convertedKey, const int keyLength, const int skip, 
 									const HitCombination *hitCombination, 
-									const SaIndexRange *saIndexRange, const unsigned int saIndexRangeNumOfChar,
+									const unsigned int *cachedSaIndex, const unsigned int cachedSaIndexNumOfChar,
 									SaIndexGroupNew* __restrict saIndexGroup, const int maxnumOfSaIndexGroup,
 									int* __restrict firstSaIndexGroupForSubPattern);
 int BWTSubPatternHammingDistSaIndexOld(const unsigned char *convertedKey, const int keyLength, const int subPatternLength, const BWT *bwt, 
@@ -286,7 +294,6 @@ int BWTDPHit(const BWT *bwt, SaIndexGroupNew* __restrict saIndexGroup, const int
 //								  BWTSaRetrievalStatistics* __restrict bwtSaRetrievalStatistics);
 unsigned int BWTSubPatternEditDistMatch(const unsigned char *convertedKey, const unsigned int keyLength, const unsigned int subPatternLength, const BWT *bwt, 
 								  const unsigned int maxError, const unsigned int skip, const unsigned int maxnumOfHit, 
-								  const SaIndexRange *saIndexRange, const unsigned int saIndexRangeNumOfChar,
 								  HitListWithPosQueryLengthError* __restrict hitList, BWTSaRetrievalStatistics* __restrict bwtSaRetrievalStatistics, 
 								  const unsigned int eliminateDuplicateStartingPos);
 int BWTGappedDPDBvsQuery(BWT *bwt, const unsigned char *convertedKey, const int queryPatternLength, 

@@ -35,8 +35,8 @@
 #define truncateRight(value, offset)			( (value) >> (offset) << (offset) )
 #define truncateLeft(value, offset)				( (value) << (offset) >> (offset) )
 // alignBoundary must be power of 2
-#define downwardAlign(offset, alignBoundary)	( ((offset) + (alignBoundary) - 1) & (- (alignBoundary)) )
-#define upwardAlign(offset, alignBoundary)		( (offset) & (- (alignBoundary)) )
+#define nextAlignedBoundary(offset, alignBoundary)	( ((offset) + (alignBoundary) - 1) & (- (alignBoundary)) )
+#define lastAlignedBoundary(offset, alignBoundary)		( (offset) & (- (alignBoundary)) )
 #define average(value1, value2)					( ((value1) & (value2)) + ((value1) ^ (value2)) / 2 )
 #define min(value1, value2)						( ((value1) < (value2)) ? (value1) : (value2) )
 #define max(value1, value2)						( ((value1) > (value2)) ? (value1) : (value2) )
@@ -49,7 +49,7 @@ void Dust(const unsigned int len, unsigned char *pattern, const unsigned int lev
 void LimitCodeGenerateCodeTable(const unsigned int limit, unsigned int** codeValue, unsigned int** codeLength);
 
 int QSortUnsignedIntOrder(const void *data, const int index1, const int index2);
-void QSort(void* __restrict data, const int numData, const size_t dataWidth, int (*QSortComp)(const void*, const int, const int) );
+void QSort(void* __restrict data, const int numData, const int dataWidth, int (*QSortComp)(const void*, const int, const int) );
 
 unsigned int checkDuplicate(int *input, const unsigned int numItem, const int minValue, const int maxValue, char* text);
 unsigned int leadingZero(const unsigned int input);
@@ -58,6 +58,9 @@ unsigned int floorLog2(const unsigned int input);
 unsigned int power(const unsigned int base, const unsigned int power);
 void formatVALAsBinary(const unsigned int input, char* output, unsigned int bitGroup);
 unsigned int getRandomSeed();
+
+void ConvertBytePackedDNAToWordPacked(const unsigned char *input, unsigned int *output, const unsigned int textLength);
+
 
 unsigned int reverseBit(unsigned int x);
 void initializeVAL(unsigned int *startAddr, const unsigned int length, const unsigned int initValue);
